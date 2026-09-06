@@ -1,0 +1,128 @@
+# S3Relay CI (HEL-431). Same shape as mobile-app's pipeline: the tests gate the
+# image; CI stops at :SHA; promotion is a reviewed digest pin in ryanlin2-control
+# read back from the registry (never :latest, never a locally-built digest).
+stages:
+  - test
+  - build
+
+include: []
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository -Xmx1g -XX:+UseG1GC -Dmaven.wagon.http.readTimeout=600000 -Dmaven.wagon.http.connectionTimeout=60000"
+  DOCKER_BUILDKIT: "1"
+
+.maven_cache: &maven_cache
+  key: maven-$CI_COMMIT_REF_SLUG
+  paths:
+    - .m2/repository/
+  policy: pull-push
+
+.dind_service: &dind_service
+  services:
+    - name: docker:27-dind
+      alias: docker
+      command: ["--dns", "8.8.8.8", "--dns", "8.8.4.4"]
+      variables:
+        DOCKER_TLS_CERTDIR: ""
+  variables:
+    DOCKER_HOST: tcp://localhost:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+
+default:
+  interruptible: true
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - scheduler_failure
+
+# The 15 tests run against a REAL MinIO (a service container), not a mock and
+# not Testcontainers — the mounted-socket API negotiation was unreliable on the
+# LAN box, and a service container is what CI does best. No docker needed here.
+s3relay-tests:
+  stage: test
+  image: maven:3.9-eclipse-temurin-21
+  timeout: 2h
+  services:
+    - name: minio/minio:RELEASE.2024-10-13T13-34-11Z
+      alias: minio
+      command: ["server", "/data"]
+      variables:
+        MINIO_ROOT_USER: s3relaytest
+        MINIO_ROOT_PASSWORD: s3relaytestsecret
+  variables:
+    S3RELAY_TEST_ENDPOINT: "http://minio:9000"
+    S3RELAY_TEST_USER: s3relaytest
+    S3RELAY_TEST_PASS: s3relaytestsecret
+    S3RELAY_TEST_BUCKET: test
+  cache:
+    - <<: *maven_cache
+  script:
+    - |
+      for i in $(seq 1 60); do
+        if curl -sf http://minio:9000/minio/health/live >/dev/null 2>&1; then echo "minio ready"; break; fi
+        sleep 2
+      done
+    # NOT -q: a silent log cannot be diagnosed (see mobile-app's pipeline).
+    - mvn -B test
+    - |
+      # A gate that never ran is not a gate: the wire suite must have executed.
+      ran=$(grep -h -o 'tests="[0-9]*"' target/surefire-reports/TEST-com.pkgrove.s3relay.S3RelayTest.xml | head -1 | tr -dc '0-9')
+      test "${ran:-0}" -ge 8 || { echo "ERROR: S3RelayTest ran ${ran:-0} tests (expected ≥ 8) — the MinIO-backed suite did not execute"; exit 1; }
+      echo "S3RelayTest ran $ran tests against the MinIO service"
+  artifacts:
+    when: always
+    paths:
+      - target/surefire-reports/
+    reports:
+      junit: target/surefire-reports/TEST-*.xml
+    expire_in: 7 days
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+build-image-s3relay:
+  stage: build
+  image: docker:27
+  timeout: 2h
+  tags:
+    - privileged
+  <<: *dind_service
+  needs:
+    - job: s3relay-tests
+  before_script:
+    - |
+      for i in $(seq 1 60); do
+        if docker info >/dev/null 2>&1; then break; fi
+        sleep 2
+      done
+    - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+  script:
+    - docker build -t "$DOCKERHUB_USERNAME/s3relay:$CI_COMMIT_SHORT_SHA" -f Dockerfile .
+    - docker push "$DOCKERHUB_USERNAME/s3relay:$CI_COMMIT_SHORT_SHA"
+    - |
+      ref="$DOCKERHUB_USERNAME/s3relay:$CI_COMMIT_SHORT_SHA"
+      digest=$(docker buildx imagetools inspect "$ref" --format "{{.Manifest.Digest}}" 2>/dev/null || true)
+      case "$digest" in
+        sha256:*) ;;
+        *) digest=$(docker buildx imagetools inspect "$ref" | awk '/^Digest:/ {print $2; exit}') ;;
+      esac
+      echo "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
+        echo "ERROR: could not read a valid digest back for $ref (got: '$digest')"; exit 1; }
+      mkdir -p evidence
+      {
+        echo "# s3relay image evidence"
+        echo "commit=$CI_COMMIT_SHA"
+        echo "pipeline=$CI_PIPELINE_URL"
+        echo "tag=$ref"
+        echo "pin=$DOCKERHUB_USERNAME/s3relay@$digest"
+      } | tee evidence/IMAGE.txt
+  artifacts:
+    paths:
+      - evidence/
+    expire_in: never
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

@@ -70,6 +70,14 @@ PersistentVolume — the cache must be safe to lose. Manifests live in
 `ryanlin2-control/manifests/s3relay`. `/q/health/live` never depends on the
 upstream, so a MinIO blip does not restart the pod.
 
+## CI
+
+GitLab (`root/s3relay`, mirror of the GitHub repo): `s3relay-tests` runs the suite
+against a MinIO **service container** and fails if the MinIO-backed wire suite did
+not execute; `build-image-s3relay` builds, pushes `:SHA`, reads the digest back
+and emits a `pin=` line. Promotion is a reviewed digest pin in
+`ryanlin2-control/manifests/s3relay` — never `:latest`, never a local build.
+
 ## Build & test
 
 ```
