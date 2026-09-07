@@ -51,17 +51,19 @@ class S3RelayErrorTest {
 
 }
 
-/** HEL-452 bench regression: large objects stream whole and ranged with byte-exact content, and a range that spans many chunks is exact. */
+/** HEL-452 bench regression: large objects are served whole and ranged (Vert.x sendFile) with byte-exact content and a real Content-Length. */
 @QuarkusTest
 @QuarkusTestResource(MinioTestResource::class)
 class S3RelayLargeObjectTest {
     private val B = MinioTestResource.BUCKET
 
     @Test
-    fun `a 1_5 MiB object (six chunks, test cache is 2 MiB) streams whole and ranged in bounded chunks with exact bytes`() {
+    fun `a 1_5 MiB object (six chunks, test cache is 2 MiB) is served whole and ranged via sendFile with exact bytes and a real Content-Length`() {
         val body = ByteArray(1_572_864).also { java.util.Random(7).nextBytes(it) }   // 6 × 256 KiB chunks; the %test cache is 2 MiB
         given().contentType("application/octet-stream").body(body).put("/$B/large-hel452.bin").then().statusCode(200)
-        val whole = given().get("/$B/large-hel452.bin").then().statusCode(200).header("Content-Length", equalTo(body.size.toString())).extract().asByteArray()
+        // sendFile data path: an exact Content-Length and never chunked — S3 clients size their reads from it.
+        val whole = given().get("/$B/large-hel452.bin").then().statusCode(200).header("Content-Length", equalTo(body.size.toString()))
+            .header("Transfer-Encoding", nullValue()).extract().asByteArray()
         assert(whole.contentEquals(body))
         val lo = 300_000; val hi = 1_200_000
         val mid = given().header("Range", "bytes=$lo-$hi").get("/$B/large-hel452.bin").then().statusCode(206)

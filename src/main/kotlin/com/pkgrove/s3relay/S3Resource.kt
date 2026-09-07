@@ -6,8 +6,7 @@ import jakarta.ws.rs.core.*
 import jakarta.ws.rs.ext.ExceptionMapper
 import jakarta.ws.rs.ext.Provider
 import org.jboss.logging.Logger
-import java.nio.channels.FileChannel
-import java.nio.file.StandardOpenOption
+import org.jboss.resteasy.reactive.PathPart
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
@@ -68,9 +67,11 @@ class S3Resource(private val gateway: Gateway) {
         return when (val o = gateway.get(bucket, key, range)) {
             is GetOutcome.Ok -> {
                 val r = o.result; val m = r.metadata
-                val stream = StreamingOutput { out -> streamRange(r, out) }
-                val b = (if (o.partial) Response.status(206) else Response.ok()).entity(stream)
-                    .header("Content-Length", m.contentLength)
+                val offset = r.range?.first ?: 0L
+                val count = r.range?.let { it.last - it.first + 1 } ?: r.totalLength
+                val b = (if (o.partial) Response.status(206) else Response.ok())
+                    .entity(PathPart(r.path, offset, count))
+                    .header("Content-Length", count)
                     .header("Accept-Ranges", "bytes")
                     .header("X-S3Relay-Cache", if (r.fromCache) "HIT" else "MISS")
                 m.contentType?.let { b.header("Content-Type", it) }
@@ -87,33 +88,16 @@ class S3Resource(private val gateway: Gateway) {
         }
     }
 
-    /**
-     * Stream [range] (or the whole file) from the cached file in BOUNDED chunks — no temp file,
-     * no whole-range buffer, no 2 GiB ceiling (HEL-452), and no more than one chunk in flight
-     * per connection. The first version used FileChannel.transferTo, whose JDK fallback for a
-     * non-file target hands the response 8 MiB slabs at a time: 16 parallel 70 MiB downloads
-     * then needed 16 × 8 MiB of Netty direct memory at once and the pod died of
-     * "Cannot reserve 65536 bytes of direct buffer memory" (LAN bench, 2026-09-07). With 256 KiB
-     * writes Vert.x's write-queue backpressure blocks this worker thread as soon as the client
-     * lags, so memory per connection stays a few hundred KiB whatever the object size.
+    /*
+     * Data path (HEL-452 bench, 2026-09-07): the body is a PathPart, which Quarkus REST hands
+     * to Vert.x `sendFile(path, offset, count)` — a Netty file region, i.e. kernel sendfile on
+     * the connection's event loop with the socket's own flow control. Nothing is copied into
+     * the JVM: no heap buffer, no Netty direct memory, no worker thread per download. Both
+     * earlier shapes broke under 16 parallel 70 MiB downloads: FileChannel.transferTo into the
+     * JAX-RS OutputStream queued 8 MiB slabs per connection, and 256 KiB chunked writes still
+     * outran the socket because a worker thread's writes are queued as event-loop tasks that
+     * the response's writeQueueFull() cannot see — direct memory filled to whatever cap it had.
      */
-    private fun streamRange(r: GetResult, out: java.io.OutputStream) {
-        FileChannel.open(r.path, StandardOpenOption.READ).use { ch ->
-            var pos = r.range?.first ?: 0L
-            var remaining = r.range?.let { it.last - it.first + 1 } ?: r.totalLength
-            val buf = java.nio.ByteBuffer.allocate(STREAM_CHUNK)
-            while (remaining > 0) {
-                buf.clear(); if (remaining < buf.capacity()) buf.limit(remaining.toInt())
-                val n = ch.read(buf, pos)
-                if (n <= 0) break
-                out.write(buf.array(), 0, n)
-                pos += n; remaining -= n
-            }
-            out.flush()
-        }
-    }
-
-    private companion object { const val STREAM_CHUNK = 256 * 1024 }
 
     // ── HeadObject: HEAD /{bucket}/{key} ────────────────────────────────────
     @HEAD @Path("{bucket}/{key:.+}")

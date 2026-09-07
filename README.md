@@ -41,6 +41,13 @@ raw failure reach the client. Three classes, kept apart end to end:
 | range starts past the object | `416 InvalidRange` + `Content-Range: bytes */<total>` |
 | a local fault the outcome types did not model (disk full, client hung up mid-upload, routing) | `500 InternalError` from the `RelayExceptionMapper`, S3 XML body, **request id on the wire (`x-amz-request-id`) and in the log next to the stack trace** — never a bare 500 page |
 
+**Data path.** A GET body is served with Vert.x `sendFile` (a Netty file region — kernel
+`sendfile` on the event loop, flow-controlled by the socket), so a download costs no JVM
+memory whatever the object size or the number of parallel clients. Responses always carry
+`Content-Length` (never chunked), which S3 clients rely on. Uploads stream to a temp file
+in bounded reads. Sizing that survived the 2026-09-07 bench (16 × 70 MiB parallel GETs +
+8 parallel 20 MiB PUTs): 1 GiB container, `-XX:MaxRAMPercentage=40 -XX:MaxDirectMemorySize=320m`.
+
 Timeouts are configuration, not code: reads/metadata `S3RELAY_UPSTREAM_TIMEOUT_MS`
 (default 8 s), PUT and the full-object download on a miss
 `S3RELAY_UPSTREAM_PUT_TIMEOUT_MS` (default 10 min). Ranges stream straight from the
