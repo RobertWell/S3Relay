@@ -26,6 +26,8 @@ class S3ObjectStorage(
     @ConfigProperty(name = "s3relay.upstream.access-key") private val accessKey: String,
     @ConfigProperty(name = "s3relay.upstream.secret-key") private val secretKey: String,
     @ConfigProperty(name = "s3relay.upstream.path-style") private val pathStyle: Boolean,
+    @ConfigProperty(name = "s3relay.upstream.timeout-ms") private val timeoutMs: Long,
+    @ConfigProperty(name = "s3relay.upstream.put-timeout-ms") private val putTimeoutMs: Long,
 ) : ObjectStorage {
 
     private val client: S3Client by lazy {
@@ -37,15 +39,23 @@ class S3ObjectStorage(
             .build()
     }
 
+    // Per-call SDK deadlines: reads get the short timeout (a stuck read must not hold a worker
+    // thread), a PUT gets the long one — a 454 MB object cannot arrive in 8 s, and a PUT that is
+    // timed out mid-flight is exactly the "pinned forever" failure HEL-452 found.
+    private fun <B : software.amazon.awssdk.awscore.AwsRequest.Builder> B.deadline(ms: Long): B = apply {
+        overrideConfiguration(software.amazon.awssdk.awscore.AwsRequestOverrideConfiguration.builder()
+            .apiCallTimeout(java.time.Duration.ofMillis(ms)).build())
+    }
+
     override fun put(bucket: String, key: String, source: Path, metadata: ObjectMetadata): String = wrap {
-        val req = PutObjectRequest.builder().bucket(bucket).key(key)
+        val req = PutObjectRequest.builder().bucket(bucket).key(key).deadline(putTimeoutMs)
             .apply { metadata.contentType?.let { contentType(it) } }
             .contentLength(metadata.contentLength).build()
         client.putObject(req, RequestBody.fromFile(source)).eTag()?.trim('"') ?: ""
     }
 
     override fun get(bucket: String, key: String, dest: Path, range: LongRange?): ObjectMetadata? = wrapNullable {
-        val req = GetObjectRequest.builder().bucket(bucket).key(key)
+        val req = GetObjectRequest.builder().bucket(bucket).key(key).deadline(putTimeoutMs)   // a download is as long as an upload
             .apply { range?.let { range("bytes=${it.first}-${it.last}") } }.build()
         // AWS SDK's toFile transformer refuses to overwrite; the cache handed us
         // a freshly-created temp file, so clear it first.
@@ -56,14 +66,14 @@ class S3ObjectStorage(
     }
 
     override fun head(bucket: String, key: String): ObjectMetadata? = wrapNullable {
-        val r = client.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build())
+        val r = client.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).deadline(timeoutMs).build())
         ObjectMetadata(r.contentLength(), r.contentType(), r.eTag()?.trim('"'), r.lastModified())
     }
 
-    override fun delete(bucket: String, key: String) { wrap { client.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(key).build()) } }
+    override fun delete(bucket: String, key: String) { wrap { client.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(key).deadline(timeoutMs).build()) } }
 
     override fun list(bucket: String, prefix: String?, delimiter: String?, continuationToken: String?, maxKeys: Int): Listing = wrap {
-        val r = client.listObjectsV2(ListObjectsV2Request.builder().bucket(bucket)
+        val r = client.listObjectsV2(ListObjectsV2Request.builder().bucket(bucket).deadline(timeoutMs)
             .apply { prefix?.let { prefix(it) }; delimiter?.let { delimiter(it) }; continuationToken?.let { continuationToken(it) } }
             .maxKeys(maxKeys).build())
         Listing(
@@ -72,17 +82,25 @@ class S3ObjectStorage(
             r.nextContinuationToken(), r.isTruncated == true)
     }
 
-    // A NoSuchKey / NoSuchBucket is a real absence (null); anything else that is a
-    // transport failure is an outage. A 4xx from S3 is authoritative, not an outage.
+    // Three classes, kept apart on purpose (HEL-452): a NoSuchKey is an ANSWER (null on the
+    // nullable paths); any other 4xx is an ANSWER too and is relayed as UpstreamError with the
+    // upstream's own status + S3 error code; a 5xx, a timeout or a transport failure is an OUTAGE
+    // (UpstreamUnavailable) — the only class the cache is allowed to paper over.
     private fun <T> wrap(block: () -> T): T = try { block() } catch (e: NoSuchKeyException) {
         throw e
     } catch (e: S3Exception) {
-        if (e.statusCode() in 500..599) throw UpstreamUnavailable("upstream ${e.statusCode()}", e) else throw e
+        if (e.statusCode() in 500..599) throw UpstreamUnavailable("upstream ${e.statusCode()}", e)
+        throw UpstreamError(e.statusCode(), e.awsErrorDetails()?.errorCode() ?: "InvalidRequest",
+            e.awsErrorDetails()?.errorMessage() ?: e.message ?: "upstream ${e.statusCode()}", e)
     } catch (e: SdkClientException) {
         throw UpstreamUnavailable(e.message ?: "upstream client error", e)
     }
 
+    // Only "the KEY is absent" is null. A 404 that says NoSuchBucket (or any other coded 4xx)
+    // is an answer about something else and is relayed as itself (HEL-452 test caught this).
     private fun <T> wrapNullable(block: () -> T): T? = try { wrap(block) }
         catch (e: NoSuchKeyException) { null }
-        catch (e: S3Exception) { if (e.statusCode() == 404) null else throw e }
+        catch (e: UpstreamError) { if (e.status == 404 && e.code in ABSENT_KEY_CODES) null else throw e }
+
+    private companion object { val ABSENT_KEY_CODES = setOf("NoSuchKey", "NotFound", "InvalidRequest") }
 }

@@ -26,6 +26,31 @@ S3 client  ──►  S3Relay  ──►  local ephemeral cache (/cache)  +  ups
 
 Object lifecycle: `CACHING → PENDING_REMOTE → SYNCING → SYNCED`.
 
+## Relay contract — every answer is an S3 answer (HEL-452)
+
+S3Relay is a bridge between MinIO and S3-compatible clients, so it never lets a
+raw failure reach the client. Three classes, kept apart end to end:
+
+| what happened upstream / locally | what the client gets |
+|---|---|
+| upstream answered **NoSuchKey** | `404 NoSuchKey` (an answer, served as such) |
+| upstream answered any other **4xx** (`NoSuchBucket`, `AccessDenied`, `InvalidArgument`, …) | **the same status and S3 error code, relayed as-is** — never dressed up as an outage or a 500. A rejected PUT drops its local copy (upstream refused it; pinning it would only fill the cache). |
+| upstream **5xx / timeout / transport failure / open breaker** | `503 ServiceUnavailable` + `Retry-After: 5` — the only class the cache is allowed to paper over: cached reads and `HEAD` keep answering from the cache, uncached ones fail bounded |
+| cache full of objects upstream has not confirmed | `507 InsufficientStorage` (never an overflow into the emptyDir cap) |
+| declared length ≠ received bytes | `400 BadDigest` |
+| range starts past the object | `416 InvalidRange` + `Content-Range: bytes */<total>` |
+| a local fault the outcome types did not model (disk full, client hung up mid-upload, routing) | `500 InternalError` from the `RelayExceptionMapper`, S3 XML body, **request id on the wire (`x-amz-request-id`) and in the log next to the stack trace** — never a bare 500 page |
+
+Timeouts are configuration, not code: reads/metadata `S3RELAY_UPSTREAM_TIMEOUT_MS`
+(default 8 s), PUT and the full-object download on a miss
+`S3RELAY_UPSTREAM_PUT_TIMEOUT_MS` (default 10 min). Ranges stream straight from the
+cached file with a bounded channel copy — no slice file, no heap buffer, no 2 GiB
+ceiling. The reconciler asks upstream (`HEAD`) before re-uploading a pending object:
+identical copy → adopted, different copy → the stale local one is dropped (upstream is
+authoritative once it holds an object), absent → uploaded; every failure is a log line
+with bucket/key. Metrics: `s3relay_put_total{outcome}`, `s3relay_get_total{outcome}`,
+`s3relay_cache_used_bytes`, `s3relay_cache_pinned_bytes`, `s3relay_cache_pending_objects`.
+
 ## S3 compatibility (initial scope)
 
 `PutObject`, `GetObject` (+ `Range`), `HeadObject`, `DeleteObject`,

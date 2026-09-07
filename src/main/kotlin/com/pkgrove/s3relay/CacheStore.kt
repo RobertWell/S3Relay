@@ -46,7 +46,9 @@ class CacheStore(
     private val log = Logger.getLogger(CacheStore::class.java)
     private val index = ConcurrentHashMap<String, CacheEntry>()
     private val bytes = AtomicLong(0)
-    private val keyLocks = ConcurrentHashMap<String, Any>()
+    // Striped locks (HEL-452): a per-key map grew without bound; 256 stripes are plenty for
+    // serialising writers to one key and never leak.
+    private val stripes = Array(256) { Any() }
 
     init {
         Files.createDirectories(objectsDir())
@@ -73,7 +75,11 @@ class CacheStore(
 
     fun usedBytes() = bytes.get()
     fun entries(): Collection<CacheEntry> = index.values
-    fun lock(bucket: String, key: String): Any = keyLocks.computeIfAbsent(id(bucket, key)) { Any() }
+    fun lock(bucket: String, key: String): Any = stripes[(id(bucket, key).hashCode() and 0x7fffffff) % stripes.size]
+    /** Bytes that cannot be evicted because upstream has not confirmed them. */
+    fun pinnedBytes(): Long = index.values.filter { !it.evictable() }.sumOf { it.size }
+    /** Would `more` bytes fit under maxBytes right now? (maxBytes <= 0 = unbounded) */
+    fun canAccept(more: Long): Boolean = maxBytes <= 0 || bytes.get() + more <= maxBytes
 
     fun get(bucket: String, key: String): Pair<Path, CacheEntry>? {
         val id = id(bucket, key)

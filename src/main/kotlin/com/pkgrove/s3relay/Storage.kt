@@ -37,3 +37,10 @@ interface ObjectStorage {
 /** Thrown when the upstream is unreachable (distinct from a genuine 404), so the
  *  read path can decide to keep serving cached bytes instead of failing. */
 class UpstreamUnavailable(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
+
+/**
+ * The upstream ANSWERED with a 4xx (NoSuchBucket, AccessDenied, InvalidArgument, …).
+ * A relay passes that answer through as itself — same status, same S3 error code —
+ * never as an outage and never as a generic 500 (HEL-452).
+ */
+class UpstreamError(val status: Int, val code: String, message: String, cause: Throwable? = null) : RuntimeException(message, cause)

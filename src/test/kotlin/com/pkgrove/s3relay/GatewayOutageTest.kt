@@ -38,7 +38,7 @@ class GatewayOutageTest {
 
     private fun gateway(fake: FakeStorage): Gateway {
         val dir = Files.createTempDirectory("gw").toString()
-        val g = Gateway(Upstream(fake, 8000), dir, 1_000_000, 0, 0.9, 0.5)
+        val g = Gateway(Upstream(fake), dir, 1_000_000, 0, 0.9, 0.5)
         g.init()   // @PostConstruct, called directly in the unit test
         return g
     }
@@ -74,9 +74,9 @@ class GatewayOutageTest {
         fake.down = true
         g.put("b", "p", bytes("later"), 5, null)
         assertEquals(SyncState.PENDING_REMOTE, g.cache.peek("b", "p")!!.state)
-        assertEquals(0, g.reconcilePending(), "cannot sync while down")
+        assertEquals(0, g.reconcilePending().synced, "cannot sync while down")
         fake.down = false
-        assertEquals(1, g.reconcilePending(), "one object healed")
+        assertEquals(1, g.reconcilePending().synced, "one object healed")
         assertEquals(SyncState.SYNCED, g.cache.peek("b", "p")!!.state)
         assertArrayEquals("later".toByteArray(), fake.store["b/p"])
     }
@@ -86,6 +86,115 @@ class GatewayOutageTest {
         g.put("b", "r", bytes("0123456789"), 10, null)
         val o = g.get("b", "r", 2L..5L)
         assertTrue(o is GetOutcome.Ok && (o).partial)
-        assertEquals("2345", Files.readString((o as GetOutcome.Ok).result.path))
+        val r = (o as GetOutcome.Ok).result
+        assertEquals(2L..5L, r.range); assertEquals(10L, r.totalLength); assertEquals(4L, r.metadata.contentLength)
+        assertEquals("2345", slice(r))
+        // no slice file was created: the tmp dir stays empty after a range read (HEL-452 leak)
+        val root0 = g.cache.javaClass.getDeclaredField("root").apply { isAccessible = true }.get(g.cache) as Path
+        assertEquals(0, Files.list(root0.resolve("tmp")).use { it.count() })
+    }
+
+    /** What the resource does: stream the resolved range from the cached file. */
+    private fun slice(r: GetResult): String {
+        val range = r.range ?: return Files.readString(r.path)
+        java.nio.channels.FileChannel.open(r.path).use { ch ->
+            val buf = java.nio.ByteBuffer.allocate((range.last - range.first + 1).toInt()); ch.position(range.first)
+            while (buf.hasRemaining() && ch.read(buf) > 0) {}
+            return String(buf.array(), 0, buf.position())
+        }
+    }
+
+    // ── HEL-452: the relay contract ─────────────────────────────────────────
+
+    class RejectingStorage(private val status: Int, private val code: String) : ObjectStorage {
+        override fun put(bucket: String, key: String, source: Path, metadata: ObjectMetadata): String = throw UpstreamError(status, code, "$code from upstream")
+        override fun get(bucket: String, key: String, dest: Path, range: LongRange?): ObjectMetadata? = throw UpstreamError(status, code, "$code from upstream")
+        override fun head(bucket: String, key: String): ObjectMetadata? = throw UpstreamError(status, code, "$code from upstream")
+        override fun delete(bucket: String, key: String) = throw UpstreamError(status, code, "$code from upstream")
+        override fun list(bucket: String, prefix: String?, delimiter: String?, continuationToken: String?, maxKeys: Int): Listing = throw UpstreamError(status, code, "$code from upstream")
+    }
+
+    @Test fun `an upstream 4xx is relayed as itself on every verb and never pins a copy`() {
+        val dir = Files.createTempDirectory("gw").toString()
+        val g = Gateway(Upstream(RejectingStorage(403, "AccessDenied")), dir, 1_000_000, 0, 0.9, 0.5); g.init()
+        val p = g.put("b", "k", bytes("x"), 1, null)
+        assertTrue(p is PutOutcome.Rejected && p.status == 403 && p.code == "AccessDenied")
+        assertNull(g.cache.peek("b", "k"), "a rejected object is not kept pinned in the cache")
+        val get = g.get("b", "k", null); assertTrue(get is GetOutcome.UpstreamError && get.status == 403)
+        val head = g.head("b", "k"); assertTrue(head is HeadOutcome.UpstreamError && head.code == "AccessDenied")
+        val del = g.delete("b", "k"); assertTrue(del is DeleteOutcome.UpstreamError && del.status == 403)
+        val list = g.list("b", null, null, null, 10); assertTrue(list is ListOutcome.UpstreamError && list.status == 403)
+    }
+
+    @Test fun `HEAD during an outage is Unavailable, not NotFound — a cached object still answers`() {
+        val fake = FakeStorage(); val g = gateway(fake)
+        g.put("b", "k", bytes("hello"), 5, "text/plain")
+        fake.down = true
+        val cached = g.head("b", "k"); assertTrue(cached is HeadOutcome.Ok && cached.fromCache && cached.metadata.contentLength == 5L)
+        assertTrue(g.head("b", "other") is HeadOutcome.Unavailable, "an outage must not read as 'object absent'")
+        assertTrue(g.delete("b", "k") is DeleteOutcome.Unavailable)
+        assertTrue(g.list("b", null, null, null, 10) is ListOutcome.Unavailable)
+    }
+
+    @Test fun `a body that fails mid-upload leaves no part file and reaches the caller as an exception`() {
+        val fake = FakeStorage(); val g = gateway(fake)
+        val failing = object : java.io.InputStream() {
+            var n = 0
+            override fun read(): Int { if (n++ > 100) throw java.io.IOException("client hung up"); return 65 }
+        }
+        val root = g.cache.javaClass.getDeclaredField("root").apply { isAccessible = true }.get(g.cache) as Path
+        assertThrows(java.io.IOException::class.java) { g.put("b", "broken", failing, null, null) }
+        assertNull(g.cache.peek("b", "broken")); assertNull(fake.store["b/broken"])
+        assertEquals(0, Files.list(root.resolve("tmp")).use { it.count() }, "temp file cleaned up")
+    }
+
+    @Test fun `a declared length that does not match the received bytes is BadRequest and nothing is kept`() {
+        val fake = FakeStorage(); val g = gateway(fake)
+        val o = g.put("b", "short", bytes("abc"), 5, null)
+        assertTrue(o is PutOutcome.BadRequest, "$o"); assertNull(g.cache.peek("b", "short")); assertNull(fake.store["b/short"])
+    }
+
+    @Test fun `a cache full of pinned objects refuses new writes with InsufficientStorage instead of overflowing`() {
+        val fake = FakeStorage(); val dir = Files.createTempDirectory("gw").toString()
+        val g = Gateway(Upstream(fake), dir, 20, 0, 0.9, 0.5); g.init()   // 20-byte cache
+        fake.down = true
+        assertTrue(g.put("b", "a", bytes("0123456789"), 10, null) is PutOutcome.NotDurable)   // pinned, 10/20
+        assertTrue(g.put("b", "b", bytes("0123456789"), 10, null) is PutOutcome.NotDurable)   // pinned, 20/20
+        val full = g.put("b", "c", bytes("0123456789"), 10, null)
+        assertTrue(full is PutOutcome.InsufficientStorage, "must not accept what it cannot hold: $full")
+        assertEquals(20L, g.cache.usedBytes()); assertEquals(20L, g.cache.pinnedBytes())
+        fake.down = false
+        assertEquals(2, g.reconcilePending().synced)
+        assertTrue(g.put("b", "c", bytes("0123456789"), 10, null) is PutOutcome.Stored, "evictable again once synced")
+    }
+
+    @Test fun `the reconciler asks upstream first — adopts an identical copy, drops a stale one, never overwrites`() {
+        val fake = FakeStorage(); val g = gateway(fake)
+        fake.down = true
+        g.put("b", "same", bytes("hello"), 5, null); g.put("b", "stale", bytes("old-version"), 11, null)
+        fake.down = false
+        fake.store["b/same"] = "hello".toByteArray()            // upstream already has the identical object (e.g. same-pod restart)
+        fake.store["b/stale"] = "NEWER upstream write".toByteArray()   // someone wrote upstream directly meanwhile
+        val r = g.reconcilePending()
+        assertEquals(1, r.adopted); assertEquals(1, r.dropped); assertEquals(0, r.synced)
+        assertEquals(SyncState.SYNCED, g.cache.peek("b", "same")!!.state)
+        assertNull(g.cache.peek("b", "stale"), "stale pending copy is dropped")
+        assertArrayEquals("NEWER upstream write".toByteArray(), fake.store["b/stale"], "the newer upstream object was NOT overwritten")
+    }
+
+    @Test fun `ranges resolve without slicing — open-ended, clamped, unsatisfiable, and past 2 GiB`() {
+        val fake = FakeStorage(); val g = gateway(fake)
+        g.put("b", "r", bytes("0123456789"), 10, null)
+        val open = g.get("b", "r", 7L..Long.MAX_VALUE) as GetOutcome.Ok
+        assertEquals(7L..9L, open.result.range); assertEquals(3L, open.result.metadata.contentLength); assertEquals("789", slice(open.result))
+        assertTrue(g.get("b", "r", 10L..12L) is GetOutcome.RangeNotSatisfiable)
+        // a sparse 2.2 GB cached object: the old code allocated the range in heap and overflowed toInt()
+        val big = g.cache.newTemp(); java.io.RandomAccessFile(big.toFile(), "rw").use { it.setLength(2_200_000_000L); it.seek(2_199_999_995L); it.write("TAIL!".toByteArray()) }
+        g.cache.commit("b", "big", big, SyncState.SYNCED, "e", null, null)
+        val tail = g.get("b", "big", 2_199_999_995L..Long.MAX_VALUE) as GetOutcome.Ok
+        assertEquals(2_199_999_995L..2_199_999_999L, tail.result.range); assertEquals(5L, tail.result.metadata.contentLength)
+        assertEquals("TAIL!", slice(tail.result))
+        val whole = g.get("b", "big", null) as GetOutcome.Ok
+        assertEquals(2_200_000_000L, whole.result.metadata.contentLength)
     }
 }
