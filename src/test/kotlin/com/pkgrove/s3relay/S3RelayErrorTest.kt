@@ -50,3 +50,31 @@ class S3RelayErrorTest {
     }
 
 }
+
+/** HEL-452 bench regression: large objects stream whole and ranged with byte-exact content, and a range that spans many chunks is exact. */
+@QuarkusTest
+@QuarkusTestResource(MinioTestResource::class)
+class S3RelayLargeObjectTest {
+    private val B = MinioTestResource.BUCKET
+
+    @Test
+    fun `a 1_5 MiB object (six chunks, test cache is 2 MiB) streams whole and ranged in bounded chunks with exact bytes`() {
+        val body = ByteArray(1_572_864).also { java.util.Random(7).nextBytes(it) }   // 6 × 256 KiB chunks; the %test cache is 2 MiB
+        given().contentType("application/octet-stream").body(body).put("/$B/large-hel452.bin").then().statusCode(200)
+        val whole = given().get("/$B/large-hel452.bin").then().statusCode(200).header("Content-Length", equalTo(body.size.toString())).extract().asByteArray()
+        assert(whole.contentEquals(body))
+        val lo = 300_000; val hi = 1_200_000
+        val mid = given().header("Range", "bytes=$lo-$hi").get("/$B/large-hel452.bin").then().statusCode(206)
+            .header("Content-Range", equalTo("bytes $lo-$hi/${body.size}")).extract().asByteArray()
+        assert(mid.contentEquals(body.copyOfRange(lo, hi + 1)))
+        // 8 parallel ranged readers of the same cached object reassemble it exactly (the bench's phase E)
+        val part = body.size / 8
+        val parts = (0 until 8).map { i -> Thread { } to i }.map { (_, i) ->
+            java.util.concurrent.CompletableFuture.supplyAsync {
+                val last = if (i < 7) (i + 1) * part - 1 else body.size - 1
+                given().header("Range", "bytes=${i * part}-$last").get("/$B/large-hel452.bin").then().statusCode(206).extract().asByteArray()
+            }
+        }.map { it.get() }
+        assert(parts.fold(ByteArray(0)) { acc, p -> acc + p }.contentEquals(body))
+    }
+}

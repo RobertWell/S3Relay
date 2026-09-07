@@ -6,7 +6,6 @@ import jakarta.ws.rs.core.*
 import jakarta.ws.rs.ext.ExceptionMapper
 import jakarta.ws.rs.ext.Provider
 import org.jboss.logging.Logger
-import java.nio.channels.Channels
 import java.nio.channels.FileChannel
 import java.nio.file.StandardOpenOption
 import java.time.Instant
@@ -88,21 +87,33 @@ class S3Resource(private val gateway: Gateway) {
         }
     }
 
-    /** Stream [range] (or the whole file) from the cached file with a bounded channel copy —
-     *  no temp file, no whole-range buffer, no 2 GiB ceiling (HEL-452). */
+    /**
+     * Stream [range] (or the whole file) from the cached file in BOUNDED chunks — no temp file,
+     * no whole-range buffer, no 2 GiB ceiling (HEL-452), and no more than one chunk in flight
+     * per connection. The first version used FileChannel.transferTo, whose JDK fallback for a
+     * non-file target hands the response 8 MiB slabs at a time: 16 parallel 70 MiB downloads
+     * then needed 16 × 8 MiB of Netty direct memory at once and the pod died of
+     * "Cannot reserve 65536 bytes of direct buffer memory" (LAN bench, 2026-09-07). With 256 KiB
+     * writes Vert.x's write-queue backpressure blocks this worker thread as soon as the client
+     * lags, so memory per connection stays a few hundred KiB whatever the object size.
+     */
     private fun streamRange(r: GetResult, out: java.io.OutputStream) {
         FileChannel.open(r.path, StandardOpenOption.READ).use { ch ->
-            val first = r.range?.first ?: 0L
+            var pos = r.range?.first ?: 0L
             var remaining = r.range?.let { it.last - it.first + 1 } ?: r.totalLength
-            val target = Channels.newChannel(out)
-            var pos = first
+            val buf = java.nio.ByteBuffer.allocate(STREAM_CHUNK)
             while (remaining > 0) {
-                val n = ch.transferTo(pos, remaining, target)
+                buf.clear(); if (remaining < buf.capacity()) buf.limit(remaining.toInt())
+                val n = ch.read(buf, pos)
                 if (n <= 0) break
+                out.write(buf.array(), 0, n)
                 pos += n; remaining -= n
             }
+            out.flush()
         }
     }
+
+    private companion object { const val STREAM_CHUNK = 256 * 1024 }
 
     // ── HeadObject: HEAD /{bucket}/{key} ────────────────────────────────────
     @HEAD @Path("{bucket}/{key:.+}")
