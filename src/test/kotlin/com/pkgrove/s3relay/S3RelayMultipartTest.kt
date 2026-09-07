@@ -80,6 +80,16 @@ class S3RelayMultipartTest {
                 c.uploadPart(UploadPartRequest.builder().bucket(B).key("mp/aborted.bin").uploadId("no-such-upload").partNumber(1).contentLength(3).build(), RequestBody.fromBytes("abc".toByteArray()))
             }
             assertEquals(404, ex.statusCode()); assertEquals("NoSuchUpload", ex.awsErrorDetails().errorCode())
+            // the rejected part's unread body must not poison the keep-alive connection: the SAME client's next call works
+            c.deleteObject(DeleteObjectRequest.builder().bucket(B).key("mp/replace.txt").build())
+            given().head("/$B/mp/replace.txt").then().statusCode(404)
+            // and a large rejected part (bigger than the drain limit) is answered with Connection: close, still followed by a working call
+            val ex2 = assertThrows(S3Exception::class.java) {
+                c.uploadPart(UploadPartRequest.builder().bucket(B).key("mp/aborted.bin").uploadId("no-such-upload").partNumber(1).contentLength(2_000_000).build(),
+                    RequestBody.fromBytes(ByteArray(2_000_000)))
+            }
+            assertEquals(404, ex2.statusCode())
+            assertTrue(c.listMultipartUploads(ListMultipartUploadsRequest.builder().bucket(B).prefix("mp/aborted.bin").build()).uploads().isEmpty())
         }
         // a Complete body that is not the expected XML is a 400 MalformedXML from the relay, never a 500
         given().contentType("application/xml").body("<CompleteMultipartUpload><Part><PartNumber>x</PartNumber></Part></CompleteMultipartUpload>")

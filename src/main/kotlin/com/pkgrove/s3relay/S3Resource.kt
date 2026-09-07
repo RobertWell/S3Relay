@@ -29,7 +29,7 @@ import java.util.UUID
 @Path("/")
 class S3Resource(private val gateway: Gateway) {
     private val log = Logger.getLogger(S3Resource::class.java)
-    private companion object { const val TUBE_CHUNK = 256 * 1024 }
+    private companion object { const val TUBE_CHUNK = 256 * 1024; const val DRAIN_LIMIT = 1L * 1024 * 1024 }
     private val httpDate = DateTimeFormatter.ofPattern("EEE, dd MMM yyyy HH:mm:ss 'GMT'").withZone(ZoneOffset.UTC)
 
     // ── ListObjectsV2: GET /{bucket}?list-type=2 ────────────────────────────
@@ -59,11 +59,12 @@ class S3Resource(private val gateway: Gateway) {
             @HeaderParam("Content-Length") contentLength: Long?,
             @HeaderParam("Content-Type") contentType: String?,
             @QueryParam("uploadId") uploadId: String?, @QueryParam("partNumber") partNumber: Int?,
-            body: java.io.InputStream): Response =
-        if (uploadId != null) {   // UploadPart (HEL-462): streamed straight to upstream, never cached
-            if (partNumber == null || partNumber < 1 || partNumber > 10000) return S3Errors.error(400, "InvalidArgument", "partNumber must be 1..10000", "/$bucket/$key")
-            if (contentLength == null || contentLength < 0) return S3Errors.error(411, "MissingContentLength", "UploadPart requires Content-Length", "/$bucket/$key")
-            multipart(gateway.uploadPart(bucket, key, uploadId, partNumber, body, contentLength), "/$bucket/$key") { Response.ok().header("ETag", "\"$it\"").build() }
+            rawBody: java.io.InputStream): Response {
+        val body = CountingInputStream(rawBody)
+        val r = if (uploadId != null) {   // UploadPart (HEL-462): streamed straight to upstream, never cached
+            if (partNumber == null || partNumber < 1 || partNumber > 10000) S3Errors.error(400, "InvalidArgument", "partNumber must be 1..10000", "/$bucket/$key")
+            else if (contentLength == null || contentLength < 0) S3Errors.error(411, "MissingContentLength", "UploadPart requires Content-Length", "/$bucket/$key")
+            else multipart(gateway.uploadPart(bucket, key, uploadId, partNumber, body, contentLength), "/$bucket/$key") { Response.ok().header("ETag", "\"$it\"").build() }
         } else when (val o = gateway.put(bucket, key, body, contentLength, contentType)) {
             is PutOutcome.Stored -> Response.ok().header("ETag", "\"${o.etag}\"").header("X-S3Relay-Cache", if (o.cached) "STORED" else "PASSTHROUGH").build()
             is PutOutcome.NotDurable -> S3Errors.unavailable("object cached locally but upstream storage failed; not durable: ${o.reason}", "/$bucket/$key")
@@ -72,6 +73,26 @@ class S3Resource(private val gateway: Gateway) {
             is PutOutcome.Rejected -> S3Errors.relay(o.status, o.code, o.message, "/$bucket/$key")
             is PutOutcome.InsufficientStorage -> S3Errors.error(507, "InsufficientStorage", o.reason, "/$bucket/$key")
         }
+        // An answer given BEFORE the request body was fully read (upstream refused a part or a pass-through early, a
+        // bounded copy gave up) leaves the rest of the body on the keep-alive connection, where it corrupts the NEXT
+        // request (LAN 2026-09-07: a rejected UploadPart made the following DELETE a 405). A small remainder is
+        // drained; a large one is not worth the bandwidth — the connection is closed instead, and the client reconnects.
+        val unread = if (contentLength != null && contentLength >= 0) contentLength - body.count else if (body.eof) 0L else Long.MAX_VALUE
+        if (unread > 0) {
+            if (unread <= DRAIN_LIMIT && runCatching { body.drain() }.isSuccess) return r
+            return Response.fromResponse(r).header("Connection", "close").build()
+        }
+        return r
+    }
+
+    /** Counts what the handlers consumed so [put] can tell whether the request body is fully read. */
+    private class CountingInputStream(private val inner: java.io.InputStream) : java.io.InputStream() {
+        var count = 0L; var eof = false
+        override fun read(): Int = inner.read().also { if (it < 0) eof = true else count++ }
+        override fun read(b: ByteArray, off: Int, len: Int): Int = inner.read(b, off, len).also { if (it < 0) eof = true else count += it }
+        override fun close() = inner.close()
+        fun drain() { val buf = ByteArray(64 * 1024); while (read(buf, 0, buf.size) >= 0) { /* discard */ } }
+    }
 
     // ── GetObject (+ Range): GET /{bucket}/{key} ────────────────────────────
     @GET @Path("{bucket}/{key:.+}")
