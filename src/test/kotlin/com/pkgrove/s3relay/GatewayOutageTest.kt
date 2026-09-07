@@ -30,6 +30,16 @@ class GatewayOutageTest {
         override fun head(bucket: String, key: String): ObjectMetadata? {
             guard(); val b = store[k(bucket, key)] ?: return null; return ObjectMetadata(b.size.toLong(), null, "etag-${b.size}", Instant.now())
         }
+        // HEL-460 tube mode: the fake streams like the real thing (the body is consumed, never replayed)
+        override fun putStream(bucket: String, key: String, body: java.io.InputStream, length: Long, contentType: String?): String {
+            guard(); val b = body.readBytes(); store[k(bucket, key)] = b; return "etag-${b.size}"
+        }
+        override fun open(bucket: String, key: String, range: LongRange?): ObjectStream? {
+            guard(); val b = store[k(bucket, key)] ?: return null
+            val slice = range?.let { b.copyOfRange(it.first.toInt(), minOf(it.last, b.size - 1L).toInt() + 1) } ?: b
+            val cr = range?.let { "bytes ${it.first}-${minOf(it.last, b.size - 1L)}/${b.size}" }
+            return ObjectStream(ObjectMetadata(slice.size.toLong(), "application/octet-stream", "etag-${b.size}", Instant.now()), slice.inputStream(), cr, b.size.toLong())
+        }
         override fun delete(bucket: String, key: String) { guard(); store.remove(k(bucket, key)) }
         override fun list(bucket: String, prefix: String?, delimiter: String?, continuationToken: String?, maxKeys: Int): Listing {
             guard(); return Listing(emptyList(), emptyList(), null, false)
@@ -110,6 +120,8 @@ class GatewayOutageTest {
         override fun put(bucket: String, key: String, source: Path, metadata: ObjectMetadata): String = throw UpstreamError(status, code, "$code from upstream")
         override fun get(bucket: String, key: String, dest: Path, range: LongRange?): ObjectMetadata? = throw UpstreamError(status, code, "$code from upstream")
         override fun head(bucket: String, key: String): ObjectMetadata? = throw UpstreamError(status, code, "$code from upstream")
+        override fun putStream(bucket: String, key: String, body: java.io.InputStream, length: Long, contentType: String?): String = throw UpstreamError(status, code, "$code from upstream")
+        override fun open(bucket: String, key: String, range: LongRange?): ObjectStream? = throw UpstreamError(status, code, "$code from upstream")
         override fun delete(bucket: String, key: String) = throw UpstreamError(status, code, "$code from upstream")
         override fun list(bucket: String, prefix: String?, delimiter: String?, continuationToken: String?, maxKeys: Int): Listing = throw UpstreamError(status, code, "$code from upstream")
     }
@@ -154,18 +166,61 @@ class GatewayOutageTest {
         assertTrue(o is PutOutcome.BadRequest, "$o"); assertNull(g.cache.peek("b", "short")); assertNull(fake.store["b/short"])
     }
 
-    @Test fun `a cache full of pinned objects refuses new writes with InsufficientStorage instead of overflowing`() {
+    @Test fun `a cache full of pinned objects passes new writes through instead of refusing or overflowing (HEL-460)`() {
         val fake = FakeStorage(); val dir = Files.createTempDirectory("gw").toString()
         val g = Gateway(Upstream(fake), dir, 20, 0, 0.9, 0.5); g.init()   // 20-byte cache
         fake.down = true
         assertTrue(g.put("b", "a", bytes("0123456789"), 10, null) is PutOutcome.NotDurable)   // pinned, 10/20
         assertTrue(g.put("b", "b", bytes("0123456789"), 10, null) is PutOutcome.NotDurable)   // pinned, 20/20
+        // no room and upstream down: the body is relayed (tube) and upstream refuses → NotStored, nothing cached, cache not overflowed
         val full = g.put("b", "c", bytes("0123456789"), 10, null)
-        assertTrue(full is PutOutcome.InsufficientStorage, "must not accept what it cannot hold: $full")
-        assertEquals(20L, g.cache.usedBytes()); assertEquals(20L, g.cache.pinnedBytes())
+        assertTrue(full is PutOutcome.NotStored, "tube mode with upstream down is an honest 503, not a 507: $full")
+        assertEquals(20L, g.cache.usedBytes()); assertEquals(20L, g.cache.pinnedBytes()); assertEquals(0L, g.cache.reservedBytes()); assertNull(g.cache.peek("b", "c"))
         fake.down = false
+        // no room but upstream up: the body is streamed straight to upstream — durable, uncached
+        val tube = g.put("b", "d", bytes("0123456789"), 10, null)
+        assertTrue(tube is PutOutcome.Stored && !tube.cached, "passed through: $tube")
+        assertArrayEquals("0123456789".toByteArray(), fake.store["b/d"]); assertNull(g.cache.peek("b", "d")); assertEquals(20L, g.cache.usedBytes())
         assertEquals(2, g.reconcilePending().synced)
-        assertTrue(g.put("b", "c", bytes("0123456789"), 10, null) is PutOutcome.Stored, "evictable again once synced")
+        val cached = g.put("b", "c", bytes("0123456789"), 10, null)
+        assertTrue(cached is PutOutcome.Stored && cached.cached, "evictable again once synced: $cached")
+    }
+
+    @Test fun `an object bigger than the whole cache is streamed from upstream, whole and ranged, and never cached (HEL-460)`() {
+        val fake = FakeStorage(); val dir = Files.createTempDirectory("gw").toString()
+        val g = Gateway(Upstream(fake), dir, 20, 0, 0.9, 0.5); g.init()   // 20-byte cache
+        fake.store["b/big"] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ".toByteArray()   // 36 bytes
+        val whole = g.get("b", "big", null)
+        assertTrue(whole is GetOutcome.Passthrough && !whole.partial, "$whole")
+        assertEquals("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", String((whole as GetOutcome.Passthrough).stream.body.readBytes())); whole.stream.close()
+        val part = g.get("b", "big", 10L..19L)
+        assertTrue(part is GetOutcome.Passthrough && part.partial, "$part")
+        part as GetOutcome.Passthrough
+        assertEquals("ABCDEFGHIJ", String(part.stream.body.readBytes())); assertEquals("bytes 10-19/36", part.stream.contentRange); assertEquals(10L, part.stream.metadata.contentLength); part.stream.close()
+        assertNull(g.cache.peek("b", "big")); assertEquals(0L, g.cache.usedBytes()); assertEquals(0L, g.cache.reservedBytes())
+        // a small object on the same gateway is fetched into the cache as before
+        fake.store["b/small"] = "tiny".toByteArray()
+        assertTrue(g.get("b", "small", null) is GetOutcome.Ok); assertEquals(SyncState.SYNCED, g.cache.peek("b", "small")!!.state)
+    }
+
+    @Test fun `room is reserved for in-flight bodies so concurrent PUTs cannot together overflow the cache (HEL-460)`() {
+        val fake = FakeStorage(); val dir = Files.createTempDirectory("gw").toString()
+        val g = Gateway(Upstream(fake), dir, 25, 0, 0.9, 0.5); g.init()   // 25-byte cache: two 10-byte bodies fit, three do not
+        val gate = java.util.concurrent.CountDownLatch(1)
+        class Slow(val bytes: ByteArray) : java.io.InputStream() {   // holds the first read until released, like a slow client
+            var i = 0; var waited = false
+            override fun read(): Int { if (!waited) { waited = true; gate.await() }; return if (i < bytes.size) bytes[i++].toInt() and 0xff else -1 }
+        }
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(3)
+        val futures = listOf("a", "b", "c").map { k -> pool.submit<PutOutcome> { g.put("b", k, Slow("0123456789".toByteArray()), 10, null) } }
+        Thread.sleep(300); assertEquals(20L, g.cache.reservedBytes(), "two bodies reserved, the third passed through")
+        gate.countDown()
+        val outs = futures.map { it.get(10, java.util.concurrent.TimeUnit.SECONDS) }
+        assertEquals(3, outs.count { it is PutOutcome.Stored }, "$outs")
+        assertEquals(1, outs.count { it is PutOutcome.Stored && !it.cached }, "exactly one went through the tube: $outs")
+        assertEquals(20L, g.cache.usedBytes()); assertEquals(0L, g.cache.reservedBytes())
+        assertEquals(3, listOf("a", "b", "c").count { fake.store["b/$it"] != null }, "all three are durable upstream")
+        pool.shutdown()
     }
 
     @Test fun `the reconciler asks upstream first — adopts an identical copy, drops a stale one, never overwrites`() {

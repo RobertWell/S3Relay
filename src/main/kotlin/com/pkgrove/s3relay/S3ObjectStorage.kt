@@ -30,13 +30,20 @@ class S3ObjectStorage(
     @ConfigProperty(name = "s3relay.upstream.put-timeout-ms") private val putTimeoutMs: Long,
 ) : ObjectStorage {
 
-    private val client: S3Client by lazy {
-        S3Client.builder()
-            .endpointOverride(URI.create(endpoint))
-            .region(Region.of(region))
-            .forcePathStyle(pathStyle)
-            .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secretKey)))
-            .build()
+    private fun builder() = S3Client.builder()
+        .endpointOverride(URI.create(endpoint))
+        .region(Region.of(region))
+        .forcePathStyle(pathStyle)
+        .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secretKey)))
+
+    private val client: S3Client by lazy { builder().build() }
+
+    /** Tube mode (HEL-460): the client for pass-through transfers — no retries (a request stream cannot be replayed
+     *  and a half-sent response cannot be restarted) and no whole-call deadline (a slow tube is allowed to be slow;
+     *  the HTTP client's socket timeout still catches a transfer that stops making progress). */
+    private val streamClient: S3Client by lazy {
+        builder().overrideConfiguration(software.amazon.awssdk.core.client.config.ClientOverrideConfiguration.builder()
+            .retryPolicy(software.amazon.awssdk.core.retry.RetryPolicy.none()).build()).build()
     }
 
     // Per-call SDK deadlines: reads get the short timeout (a stuck read must not hold a worker
@@ -52,6 +59,22 @@ class S3ObjectStorage(
             .apply { metadata.contentType?.let { contentType(it) } }
             .contentLength(metadata.contentLength).build()
         client.putObject(req, RequestBody.fromFile(source)).eTag()?.trim('"') ?: ""
+    }
+
+    override fun putStream(bucket: String, key: String, body: java.io.InputStream, length: Long, contentType: String?): String = wrap {
+        val req = PutObjectRequest.builder().bucket(bucket).key(key).contentLength(length)
+            .apply { contentType?.let { contentType(it) } }.build()
+        streamClient.putObject(req, RequestBody.fromInputStream(body, length)).eTag()?.trim('"') ?: ""
+    }
+
+    override fun open(bucket: String, key: String, range: LongRange?): ObjectStream? = wrapNullable {
+        val req = GetObjectRequest.builder().bucket(bucket).key(key)
+            .apply { range?.let { range(if (it.last == Long.MAX_VALUE) "bytes=${it.first}-" else "bytes=${it.first}-${it.last}") } }.build()
+        val rs = streamClient.getObject(req)
+        val r = rs.response()
+        // Content-Range "bytes a-b/total" carries the whole object's size on a ranged answer.
+        val total = r.contentRange()?.substringAfterLast('/')?.toLongOrNull() ?: if (range == null) r.contentLength() else null
+        ObjectStream(ObjectMetadata(r.contentLength(), r.contentType(), r.eTag()?.trim('"'), r.lastModified()), rs, r.contentRange(), total)
     }
 
     override fun get(bucket: String, key: String, dest: Path, range: LongRange?): ObjectMetadata? = wrapNullable {

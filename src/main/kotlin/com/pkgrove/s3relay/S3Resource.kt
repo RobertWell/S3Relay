@@ -28,6 +28,8 @@ import java.util.UUID
 @ApplicationScoped
 @Path("/")
 class S3Resource(private val gateway: Gateway) {
+    private val log = Logger.getLogger(S3Resource::class.java)
+    private companion object { const val TUBE_CHUNK = 256 * 1024 }
     private val httpDate = DateTimeFormatter.ofPattern("EEE, dd MMM yyyy HH:mm:ss 'GMT'").withZone(ZoneOffset.UTC)
 
     // ── ListObjectsV2: GET /{bucket}?list-type=2 ────────────────────────────
@@ -52,8 +54,9 @@ class S3Resource(private val gateway: Gateway) {
             @HeaderParam("Content-Type") contentType: String?,
             body: java.io.InputStream): Response =
         when (val o = gateway.put(bucket, key, body, contentLength, contentType)) {
-            is PutOutcome.Stored -> Response.ok().header("ETag", "\"${o.etag}\"").build()
+            is PutOutcome.Stored -> Response.ok().header("ETag", "\"${o.etag}\"").header("X-S3Relay-Cache", if (o.cached) "STORED" else "PASSTHROUGH").build()
             is PutOutcome.NotDurable -> S3Errors.unavailable("object cached locally but upstream storage failed; not durable: ${o.reason}", "/$bucket/$key")
+            is PutOutcome.NotStored -> S3Errors.unavailable("upstream storage failed and the object was passed through (not cached); not stored: ${o.reason}", "/$bucket/$key")
             is PutOutcome.BadRequest -> S3Errors.error(400, "BadDigest", o.reason, "/$bucket/$key")
             is PutOutcome.Rejected -> S3Errors.relay(o.status, o.code, o.message, "/$bucket/$key")
             is PutOutcome.InsufficientStorage -> S3Errors.error(507, "InsufficientStorage", o.reason, "/$bucket/$key")
@@ -62,9 +65,10 @@ class S3Resource(private val gateway: Gateway) {
     // ── GetObject (+ Range): GET /{bucket}/{key} ────────────────────────────
     @GET @Path("{bucket}/{key:.+}")
     fun get(@PathParam("bucket") bucket: String, @PathParam("key") key: String,
-            @HeaderParam("Range") rangeHeader: String?): Response {
+            @HeaderParam("Range") rangeHeader: String?, @Context rc: io.vertx.ext.web.RoutingContext): Response {
         val range = parseRange(rangeHeader)
         return when (val o = gateway.get(bucket, key, range)) {
+            is GetOutcome.Passthrough -> { tube(o, rc.response(), "/$bucket/$key"); Response.ok().build() }
             is GetOutcome.Ok -> {
                 val r = o.result; val m = r.metadata
                 val offset = r.range?.first ?: 0L
@@ -85,6 +89,40 @@ class S3Resource(private val gateway: Gateway) {
                 .let { Response.fromResponse(it).header("Content-Range", "bytes */${o.totalLength}").build() }
             is GetOutcome.UpstreamError -> S3Errors.relay(o.status, o.code, o.message, "/$bucket/$key")
             is GetOutcome.Unavailable -> S3Errors.unavailable(o.reason, "/$bucket/$key")
+        }
+    }
+
+    /**
+     * Tube mode (HEL-460): an object the cache cannot hold is relayed upstream → client with exactly ONE chunk in
+     * flight — each Vert.x write is awaited before the next read — so memory per connection is one 256 KiB chunk
+     * whatever the size or the client's pace. Written on the Vert.x response directly: the JAX-RS output stream
+     * queues faster than the socket's backpressure can signal (the HEL-452 direct-memory failure), and Quarkus
+     * REST's Multi streaming would force chunked transfer-encoding on S3 clients that expect Content-Length.
+     * Quarkus REST skips its own status/headers/end once the response is ended here. A client that walks away
+     * makes the write fail: the upstream stream is aborted and nothing is logged above DEBUG.
+     */
+    private fun tube(o: GetOutcome.Passthrough, resp: io.vertx.core.http.HttpServerResponse, resource: String) {
+        val s = o.stream; val m = s.metadata
+        try {
+            resp.setStatusCode(if (o.partial) 206 else 200)
+            resp.putHeader("Content-Length", m.contentLength.toString()).putHeader("Accept-Ranges", "bytes").putHeader("X-S3Relay-Cache", "PASSTHROUGH")
+            m.contentType?.let { resp.putHeader("Content-Type", it) }
+            m.etag?.let { resp.putHeader("ETag", "\"$it\"") }
+            m.lastModified?.let { resp.putHeader("Last-Modified", httpDate.format(it)) }
+            s.contentRange?.let { resp.putHeader("Content-Range", it) }
+            val buf = ByteArray(TUBE_CHUNK)
+            while (true) {
+                val n = s.body.read(buf); if (n < 0) break
+                resp.write(io.vertx.core.buffer.Buffer.buffer(buf.copyOf(n))).toCompletionStage().toCompletableFuture().get()
+            }
+            resp.end().toCompletionStage().toCompletableFuture().get()
+            s.close()
+        } catch (e: Exception) {
+            // Either the client left (write failed) or upstream broke mid-stream: the head is on the wire, so the only
+            // honest signal is to drop the connection — the client sees a short body, never a fake success.
+            log.debugf("pass-through GET %s ended early: %s", resource, e.message)
+            s.abort()
+            runCatching { resp.close() }
         }
     }
 

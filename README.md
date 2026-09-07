@@ -35,11 +35,20 @@ raw failure reach the client. Three classes, kept apart end to end:
 |---|---|
 | upstream answered **NoSuchKey** | `404 NoSuchKey` (an answer, served as such) |
 | upstream answered any other **4xx** (`NoSuchBucket`, `AccessDenied`, `InvalidArgument`, …) | **the same status and S3 error code, relayed as-is** — never dressed up as an outage or a 500. A rejected PUT drops its local copy (upstream refused it; pinning it would only fill the cache). |
+| the object does not fit the cache (PUT or GET miss) | **passed through** to/from upstream, streamed, uncached — never a 507 for size (HEL-460) |
 | upstream **5xx / timeout / transport failure / open breaker** | `503 ServiceUnavailable` + `Retry-After: 5` — the only class the cache is allowed to paper over: cached reads and `HEAD` keep answering from the cache, uncached ones fail bounded |
 | cache full of objects upstream has not confirmed | `507 InsufficientStorage` (never an overflow into the emptyDir cap) |
 | declared length ≠ received bytes | `400 BadDigest` |
 | range starts past the object | `416 InvalidRange` + `Content-Range: bytes */<total>` |
 | a local fault the outcome types did not model (disk full, client hung up mid-upload, routing) | `500 InternalError` from the `RelayExceptionMapper`, S3 XML body, **request id on the wire (`x-amz-request-id`) and in the log next to the stack trace** — never a bare 500 page |
+
+**Tube mode (HEL-460).** The cache is an accelerator, never a gate: an object the cache cannot hold (bigger than
+the cache, or the cache full of objects not yet confirmed upstream) is **passed through** — a PUT streams straight
+to upstream (durable success still means upstream confirmed it; `X-S3Relay-Cache: PASSTHROUGH`, nothing cached), a
+GET streams straight from upstream to the client with one chunk in flight (`X-S3Relay-Cache: PASSTHROUGH`, ranges
+honoured, `Content-Length` kept). Room for in-flight bodies is reserved, so concurrent large PUTs cannot overflow
+the disk together. Slower, never a failure for size. The only 507 left is a body of *unknown* length that outgrows
+the cache mid-copy (it cannot be replayed upstream — send `Content-Length`).
 
 **Data path.** A GET body is served with Vert.x `sendFile` (a Netty file region — kernel
 `sendfile` on the event loop, flow-controlled by the socket), so a download costs no JVM

@@ -27,11 +27,27 @@ data class Listing(val objects: List<ListedObject>, val commonPrefixes: List<Str
 interface ObjectStorage {
     /** Uploads the file at `source` as (bucket,key). Returns the stored ETag. */
     fun put(bucket: String, key: String, source: Path, metadata: ObjectMetadata): String
+    /** Tube mode (HEL-460): uploads `body` as (bucket,key) straight from the request stream, `length` bytes, never
+     *  buffered and never retried (the stream cannot be replayed). Returns the stored ETag. */
+    fun putStream(bucket: String, key: String, body: java.io.InputStream, length: Long, contentType: String?): String
     /** Streams (bucket,key) into `dest`; null if absent. `range` = [first,last] inclusive, or null. */
     fun get(bucket: String, key: String, dest: Path, range: LongRange?): ObjectMetadata?
+    /** Opens (bucket,key) as a stream the caller drains (to disk, or straight to a client — HEL-460); null if absent.
+     *  The metadata describes the BODY that will flow (the range's length for a ranged open). */
+    fun open(bucket: String, key: String, range: LongRange?): ObjectStream?
     fun head(bucket: String, key: String): ObjectMetadata?
     fun delete(bucket: String, key: String)
     fun list(bucket: String, prefix: String?, delimiter: String?, continuationToken: String?, maxKeys: Int): Listing
+}
+
+/**
+ * An open upstream object: its bytes as a stream plus what the upstream said about them. `close()` releases the
+ * connection; `abort()` drops it without draining (a client walked away mid-transfer). `contentRange` is the
+ * upstream's `Content-Range` for a ranged open; `totalLength` the whole object's size when known.
+ */
+class ObjectStream(val metadata: ObjectMetadata, val body: java.io.InputStream, val contentRange: String?, val totalLength: Long?) : java.io.Closeable {
+    override fun close() { runCatching { body.close() } }
+    fun abort() { runCatching { (body as? software.amazon.awssdk.http.Abortable)?.abort() }; close() }
 }
 
 /** Thrown when the upstream is unreachable (distinct from a genuine 404), so the

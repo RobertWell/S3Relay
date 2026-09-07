@@ -46,6 +46,9 @@ class CacheStore(
     private val log = Logger.getLogger(CacheStore::class.java)
     private val index = ConcurrentHashMap<String, CacheEntry>()
     private val bytes = AtomicLong(0)
+    // Bytes promised to transfers still in flight (temp files being written). Without this, N concurrent PUTs each
+    // saw an empty cache, each passed canAccept, and together overflowed the emptyDir (HEL-460).
+    private val reserved = AtomicLong(0)
     // Striped locks (HEL-452): a per-key map grew without bound; 256 stripes are plenty for
     // serialising writers to one key and never leak.
     private val stripes = Array(256) { Any() }
@@ -78,8 +81,20 @@ class CacheStore(
     fun lock(bucket: String, key: String): Any = stripes[(id(bucket, key).hashCode() and 0x7fffffff) % stripes.size]
     /** Bytes that cannot be evicted because upstream has not confirmed them. */
     fun pinnedBytes(): Long = index.values.filter { !it.evictable() }.sumOf { it.size }
-    /** Would `more` bytes fit under maxBytes right now? (maxBytes <= 0 = unbounded) */
-    fun canAccept(more: Long): Boolean = maxBytes <= 0 || bytes.get() + more <= maxBytes
+    /** Would `more` bytes fit under maxBytes right now, counting what in-flight transfers have reserved? (maxBytes <= 0 = unbounded) */
+    fun canAccept(more: Long): Boolean = maxBytes <= 0 || bytes.get() + reserved.get() + more <= maxBytes
+    fun reservedBytes() = reserved.get()
+
+    /** Atomically claim room for an in-flight transfer of `n` bytes; false when it would not fit. Pair with [release]. */
+    fun tryReserve(n: Long): Boolean {
+        if (n <= 0) return true
+        while (true) {
+            val cur = reserved.get()
+            if (maxBytes > 0 && bytes.get() + cur + n > maxBytes) return false
+            if (reserved.compareAndSet(cur, cur + n)) return true
+        }
+    }
+    fun release(n: Long) { if (n > 0) reserved.addAndGet(-n) }
 
     fun get(bucket: String, key: String): Pair<Path, CacheEntry>? {
         val id = id(bucket, key)
