@@ -38,7 +38,21 @@ interface ObjectStorage {
     fun head(bucket: String, key: String): ObjectMetadata?
     fun delete(bucket: String, key: String)
     fun list(bucket: String, prefix: String?, delimiter: String?, continuationToken: String?, maxKeys: Int): Listing
+    // ── Multipart upload (HEL-462): pure pass-through, parts are never cached or buffered ──
+    fun createMultipart(bucket: String, key: String, contentType: String?): String
+    /** Streams one part; returns its ETag. */
+    fun uploadPart(bucket: String, key: String, uploadId: String, partNumber: Int, body: java.io.InputStream, length: Long): String
+    /** Completes; returns the object's ETag. `parts` = (partNumber, etag) in order. */
+    fun completeMultipart(bucket: String, key: String, uploadId: String, parts: List<Pair<Int, String>>): String
+    fun abortMultipart(bucket: String, key: String, uploadId: String)
+    fun listMultipartUploads(bucket: String, prefix: String?, keyMarker: String?, uploadIdMarker: String?, maxUploads: Int): MultipartUploads
+    fun listParts(bucket: String, key: String, uploadId: String, partNumberMarker: Int?, maxParts: Int): MultipartParts
 }
+
+data class MultipartUpload(val key: String, val uploadId: String, val initiated: Instant?)
+data class MultipartUploads(val uploads: List<MultipartUpload>, val nextKeyMarker: String?, val nextUploadIdMarker: String?, val truncated: Boolean)
+data class MultipartPart(val partNumber: Int, val etag: String?, val size: Long, val lastModified: Instant?)
+data class MultipartParts(val parts: List<MultipartPart>, val nextPartNumberMarker: Int?, val truncated: Boolean)
 
 /**
  * An open upstream object: its bytes as a stream plus what the upstream said about them. `close()` releases the

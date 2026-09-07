@@ -50,6 +50,12 @@ honoured, `Content-Length` kept). Room for in-flight bodies is reserved, so conc
 the disk together. Slower, never a failure for size. The only 507 left is a body of *unknown* length that outgrows
 the cache mid-copy (it cannot be replayed upstream — send `Content-Length`).
 
+**Multipart uploads (HEL-462).** `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`,
+`ListMultipartUploads` and `ListParts` are passed through to upstream — parts stream straight there with `Content-Length`,
+nothing is buffered or cached; upstream's ids, ETags and 4xx answers are relayed as-is. Complete drops any cached copy of
+the key, so the next GET fetches (or tubes) the new object. This is what `aws s3 cp`, boto3 `upload_file` and every SDK
+transfer manager do above ~8 MiB.
+
 **Data path.** A GET body is served with Vert.x `sendFile` (a Netty file region — kernel
 `sendfile` on the event loop, flow-controlled by the socket), so a download costs no JVM
 memory whatever the object size or the number of parallel clients. Responses always carry

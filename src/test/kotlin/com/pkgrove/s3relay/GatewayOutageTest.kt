@@ -44,6 +44,24 @@ class GatewayOutageTest {
         override fun list(bucket: String, prefix: String?, delimiter: String?, continuationToken: String?, maxKeys: Int): Listing {
             guard(); return Listing(emptyList(), emptyList(), null, false)
         }
+        // multipart (HEL-462): the fake assembles parts in memory — tests only
+        val parts = ConcurrentHashMap<String, java.util.TreeMap<Int, ByteArray>>()
+        override fun createMultipart(bucket: String, key: String, contentType: String?): String { guard(); val id = "up-${parts.size + 1}"; parts[id] = java.util.TreeMap(); return id }
+        override fun uploadPart(bucket: String, key: String, uploadId: String, partNumber: Int, body: java.io.InputStream, length: Long): String {
+            guard(); val b = body.readBytes(); (parts[uploadId] ?: throw UpstreamError(404, "NoSuchUpload", "no such upload"))[partNumber] = b; return "part-${b.size}"
+        }
+        override fun completeMultipart(bucket: String, key: String, uploadId: String, parts: List<Pair<Int, String>>): String {
+            guard(); val m = this.parts.remove(uploadId) ?: throw UpstreamError(404, "NoSuchUpload", "no such upload")
+            val all = m.values.fold(ByteArray(0)) { a, b -> a + b }; store[k(bucket, key)] = all; return "etag-${all.size}"
+        }
+        override fun abortMultipart(bucket: String, key: String, uploadId: String) { guard(); parts.remove(uploadId) ?: throw UpstreamError(404, "NoSuchUpload", "no such upload") }
+        override fun listMultipartUploads(bucket: String, prefix: String?, keyMarker: String?, uploadIdMarker: String?, maxUploads: Int): MultipartUploads {
+            guard(); return MultipartUploads(parts.keys.map { MultipartUpload("?", it, Instant.now()) }, null, null, false)
+        }
+        override fun listParts(bucket: String, key: String, uploadId: String, partNumberMarker: Int?, maxParts: Int): MultipartParts {
+            guard(); val m = parts[uploadId] ?: throw UpstreamError(404, "NoSuchUpload", "no such upload")
+            return MultipartParts(m.map { (n, b) -> MultipartPart(n, "part-${b.size}", b.size.toLong(), Instant.now()) }, null, false)
+        }
     }
 
     private fun gateway(fake: FakeStorage): Gateway {
@@ -123,6 +141,12 @@ class GatewayOutageTest {
         override fun putStream(bucket: String, key: String, body: java.io.InputStream, length: Long, contentType: String?): String = throw UpstreamError(status, code, "$code from upstream")
         override fun open(bucket: String, key: String, range: LongRange?): ObjectStream? = throw UpstreamError(status, code, "$code from upstream")
         override fun delete(bucket: String, key: String) = throw UpstreamError(status, code, "$code from upstream")
+        override fun createMultipart(bucket: String, key: String, contentType: String?): String = throw UpstreamError(status, code, "$code from upstream")
+        override fun uploadPart(bucket: String, key: String, uploadId: String, partNumber: Int, body: java.io.InputStream, length: Long): String = throw UpstreamError(status, code, "$code from upstream")
+        override fun completeMultipart(bucket: String, key: String, uploadId: String, parts: List<Pair<Int, String>>): String = throw UpstreamError(status, code, "$code from upstream")
+        override fun abortMultipart(bucket: String, key: String, uploadId: String) = throw UpstreamError(status, code, "$code from upstream")
+        override fun listMultipartUploads(bucket: String, prefix: String?, keyMarker: String?, uploadIdMarker: String?, maxUploads: Int): MultipartUploads = throw UpstreamError(status, code, "$code from upstream")
+        override fun listParts(bucket: String, key: String, uploadId: String, partNumberMarker: Int?, maxParts: Int): MultipartParts = throw UpstreamError(status, code, "$code from upstream")
         override fun list(bucket: String, prefix: String?, delimiter: String?, continuationToken: String?, maxKeys: Int): Listing = throw UpstreamError(status, code, "$code from upstream")
     }
 

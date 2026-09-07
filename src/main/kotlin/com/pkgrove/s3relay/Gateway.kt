@@ -56,6 +56,25 @@ class Upstream(private val storage: ObjectStorage) {
     @Timeout(value = 8000)
     fun delete(bucket: String, key: String) = storage.delete(bucket, key)
 
+    // ── Multipart (HEL-462): control calls bounded; a part streams without a deadline (tube) ──
+    @Timeout(value = 8000)
+    @CircuitBreaker(requestVolumeThreshold = 4, failureRatio = 0.5, delay = 5000, successThreshold = 2, skipOn = [UpstreamError::class])
+    fun createMultipart(bucket: String, key: String, contentType: String?): String = storage.createMultipart(bucket, key, contentType)
+    @CircuitBreaker(requestVolumeThreshold = 4, failureRatio = 0.5, delay = 5000, successThreshold = 2, skipOn = [UpstreamError::class])
+    fun uploadPart(bucket: String, key: String, uploadId: String, partNumber: Int, body: java.io.InputStream, length: Long): String =
+        storage.uploadPart(bucket, key, uploadId, partNumber, body, length)
+    @Timeout(value = 600000)
+    @CircuitBreaker(requestVolumeThreshold = 4, failureRatio = 0.5, delay = 5000, successThreshold = 2, skipOn = [UpstreamError::class])
+    fun completeMultipart(bucket: String, key: String, uploadId: String, parts: List<Pair<Int, String>>): String = storage.completeMultipart(bucket, key, uploadId, parts)
+    @Timeout(value = 8000)
+    fun abortMultipart(bucket: String, key: String, uploadId: String) = storage.abortMultipart(bucket, key, uploadId)
+    @Timeout(value = 8000)
+    fun listMultipartUploads(bucket: String, prefix: String?, keyMarker: String?, uploadIdMarker: String?, maxUploads: Int): MultipartUploads =
+        storage.listMultipartUploads(bucket, prefix, keyMarker, uploadIdMarker, maxUploads)
+    @Timeout(value = 8000)
+    fun listParts(bucket: String, key: String, uploadId: String, partNumberMarker: Int?, maxParts: Int): MultipartParts =
+        storage.listParts(bucket, key, uploadId, partNumberMarker, maxParts)
+
     @Timeout(value = 8000)
     fun list(bucket: String, prefix: String?, delimiter: String?, token: String?, maxKeys: Int): Listing =
         storage.list(bucket, prefix, delimiter, token, maxKeys)
@@ -319,7 +338,35 @@ class Gateway(
 
     fun maybeEvict() { if (cache.overHighWatermark()) cache.evictToLowWatermark() }
 
+    // ── Multipart upload (HEL-462): the relay is a tube for every step — nothing buffered, nothing cached.
+    //    Complete drops any cached copy of the key: a new version now exists upstream and the next GET fetches it. ──
+    fun <T> multipart(op: String, block: () -> T): MultipartOutcome<T> = try {
+        MultipartOutcome.Ok(block()).also { count("s3relay_multipart_total", "op", op, "outcome", "ok") }
+    } catch (e: UpstreamError) {
+        count("s3relay_multipart_total", "op", op, "outcome", "rejected"); MultipartOutcome.UpstreamError(e.status, e.code, e.message ?: e.code)
+    } catch (e: Exception) {
+        log.warnf("multipart %s failed: %s", op, e.message); count("s3relay_multipart_total", "op", op, "outcome", "unavailable")
+        MultipartOutcome.Unavailable(e.message ?: "upstream unavailable")
+    }
+    fun createMultipart(bucket: String, key: String, contentType: String?) = multipart("create") { upstream.createMultipart(bucket, key, contentType) }
+    fun uploadPart(bucket: String, key: String, uploadId: String, partNumber: Int, body: java.io.InputStream, length: Long) =
+        multipart("upload_part") { upstream.uploadPart(bucket, key, uploadId, partNumber, body, length) }
+    fun completeMultipart(bucket: String, key: String, uploadId: String, parts: List<Pair<Int, String>>) = multipart("complete") {
+        upstream.completeMultipart(bucket, key, uploadId, parts).also { cache.remove(bucket, key) }
+    }
+    fun abortMultipart(bucket: String, key: String, uploadId: String) = multipart("abort") { upstream.abortMultipart(bucket, key, uploadId) }
+    fun listMultipartUploads(bucket: String, prefix: String?, keyMarker: String?, uploadIdMarker: String?, maxUploads: Int) =
+        multipart("list_uploads") { upstream.listMultipartUploads(bucket, prefix, keyMarker, uploadIdMarker, maxUploads) }
+    fun listParts(bucket: String, key: String, uploadId: String, partNumberMarker: Int?, maxParts: Int) =
+        multipart("list_parts") { upstream.listParts(bucket, key, uploadId, partNumberMarker, maxParts) }
+
     private companion object { const val COPY_CHUNK = 256 * 1024 }
+}
+
+sealed interface MultipartOutcome<out T> {
+    data class Ok<T>(val value: T) : MultipartOutcome<T>
+    data class UpstreamError(val status: Int, val code: String, val message: String) : MultipartOutcome<Nothing>
+    data class Unavailable(val reason: String) : MultipartOutcome<Nothing>
 }
 
 data class ReconcileReport(val synced: Int, val adopted: Int, val dropped: Int, val failed: Int) {

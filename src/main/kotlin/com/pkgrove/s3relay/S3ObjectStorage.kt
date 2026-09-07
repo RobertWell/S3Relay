@@ -105,6 +105,33 @@ class S3ObjectStorage(
             r.nextContinuationToken(), r.isTruncated == true)
     }
 
+    // ── Multipart (HEL-462): parts stream on the no-retry client; the control calls take the read deadline ──
+    override fun createMultipart(bucket: String, key: String, contentType: String?): String = wrap {
+        client.createMultipartUpload(CreateMultipartUploadRequest.builder().bucket(bucket).key(key).deadline(timeoutMs)
+            .apply { contentType?.let { contentType(it) } }.build()).uploadId()
+    }
+    override fun uploadPart(bucket: String, key: String, uploadId: String, partNumber: Int, body: java.io.InputStream, length: Long): String = wrap {
+        streamClient.uploadPart(UploadPartRequest.builder().bucket(bucket).key(key).uploadId(uploadId).partNumber(partNumber).contentLength(length).build(),
+            RequestBody.fromInputStream(body, length)).eTag()?.trim('"') ?: ""
+    }
+    override fun completeMultipart(bucket: String, key: String, uploadId: String, parts: List<Pair<Int, String>>): String = wrap {
+        client.completeMultipartUpload(CompleteMultipartUploadRequest.builder().bucket(bucket).key(key).uploadId(uploadId).deadline(putTimeoutMs)
+            .multipartUpload(CompletedMultipartUpload.builder().parts(parts.map { (n, e) -> CompletedPart.builder().partNumber(n).eTag(e).build() }).build())
+            .build()).eTag()?.trim('"') ?: ""
+    }
+    override fun abortMultipart(bucket: String, key: String, uploadId: String) { wrap {
+        client.abortMultipartUpload(AbortMultipartUploadRequest.builder().bucket(bucket).key(key).uploadId(uploadId).deadline(timeoutMs).build()) } }
+    override fun listMultipartUploads(bucket: String, prefix: String?, keyMarker: String?, uploadIdMarker: String?, maxUploads: Int): MultipartUploads = wrap {
+        val r = client.listMultipartUploads(ListMultipartUploadsRequest.builder().bucket(bucket).maxUploads(maxUploads).deadline(timeoutMs)
+            .apply { prefix?.let { prefix(it) }; keyMarker?.let { keyMarker(it) }; uploadIdMarker?.let { uploadIdMarker(it) } }.build())
+        MultipartUploads(r.uploads().map { MultipartUpload(it.key(), it.uploadId(), it.initiated()) }, r.nextKeyMarker(), r.nextUploadIdMarker(), r.isTruncated == true)
+    }
+    override fun listParts(bucket: String, key: String, uploadId: String, partNumberMarker: Int?, maxParts: Int): MultipartParts = wrap {
+        val r = client.listParts(ListPartsRequest.builder().bucket(bucket).key(key).uploadId(uploadId).maxParts(maxParts).deadline(timeoutMs)
+            .apply { partNumberMarker?.let { partNumberMarker(it) } }.build())
+        MultipartParts(r.parts().map { MultipartPart(it.partNumber(), it.eTag()?.trim('"'), it.size(), it.lastModified()) }, r.nextPartNumberMarker(), r.isTruncated == true)
+    }
+
     // Three classes, kept apart on purpose (HEL-452): a NoSuchKey is an ANSWER (null on the
     // nullable paths); any other 4xx is an ANSWER too and is relayed as UpstreamError with the
     // upstream's own status + S3 error code; a 5xx, a timeout or a transport failure is an OUTAGE
