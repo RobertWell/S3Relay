@@ -46,7 +46,11 @@ s3relay-tests:
   image: maven:3.9-eclipse-temurin-21
   timeout: 2h
   services:
-    - name: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    # MinIO stopped publishing container images around 2026-09-30 (Docker Hub minio/minio is gone, quay is 401),
+    # so the old service image no longer pulls (pipeline 2724: ErrImagePull NotFound). This is the HEL-614 test
+    # image: alpine plus the checksum-verified GitHub release binary, published under our namespace and pinned
+    # by digest. S3Relay's 32 tests pass against it (2026-10-25, HEL-718).
+    - name: roguerzzz123/minio-test:RELEASE.2025-09-07T16-13-09Z@sha256:7ddc0698071c25ef8be60e0c031969699aa95c373137b93f82409aeb64f5b3c0
       alias: minio
       command: ["server", "/data"]
       variables:
