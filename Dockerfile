@@ -12,6 +12,11 @@ RUN mvn -B -ntp -DskipTests package
 
 FROM registry.access.redhat.com/ubi9/openjdk-21:1.21
 ENV LANGUAGE='en_US:en'
+# HEL-718 (2026-10-25): the 1.21 base lags UBI's own errata. Prod's digest 920502fa carried 58 fixable
+# HIGH/CRITICAL OS packages (CRITICAL ca-certificates CVE-2026-114406) found by hello-sre's nightly
+# prod-digest rescan. Apply the errata at build time; the digest pin records exactly what was produced.
+USER root
+RUN microdnf -y update && microdnf clean all
 COPY --from=build --chown=185 /src/target/quarkus-app/lib/     /deployments/lib/
 COPY --from=build --chown=185 /src/target/quarkus-app/*.jar    /deployments/
 COPY --from=build --chown=185 /src/target/quarkus-app/app/     /deployments/app/
