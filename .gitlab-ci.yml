@@ -49,7 +49,9 @@ s3relay-tests:
     # MinIO stopped publishing container images around 2026-09-30 (Docker Hub minio/minio is gone, quay is 401),
     # so the old service image no longer pulls (pipeline 2724: ErrImagePull NotFound). This is the HEL-614 test
     # image: alpine plus the checksum-verified GitHub release binary, published under our namespace and pinned
-    # by digest. S3Relay's 32 tests pass against it (2026-10-25, HEL-718).
+    # by digest. S3Relay's 32 tests pass against it (2026-10-25, HEL-718). Recipe, rebuild and the check of the
+    # binary inside a published digest: ci/minio-test/Dockerfile. Note: GitLab hands this job's variables
+    # (project-level DOCKERHUB_TOKEN included) to services too, so only an image we built and checked belongs here.
     - name: roguerzzz123/minio-test:RELEASE.2025-09-07T16-13-09Z@sha256:7ddc0698071c25ef8be60e0c031969699aa95c373137b93f82409aeb64f5b3c0
       alias: minio
       command: ["server", "/data"]
