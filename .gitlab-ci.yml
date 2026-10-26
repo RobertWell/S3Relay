@@ -99,6 +99,13 @@ build-image-s3relay:
   <<: *dind_service
   needs:
     - job: s3relay-tests
+  # DOCKERHUB_USERNAME/DOCKERHUB_TOKEN are scoped to this environment (GitLab CI variable
+  # environment_scope=dockerhub, set 2026-10-26, HEL-718 review): only jobs that declare it
+  # receive them, so the test job and its service containers never see the push token.
+  # `action: prepare` records no deployment.
+  environment:
+    name: dockerhub
+    action: prepare
   before_script:
     - |
       for i in $(seq 1 60); do
