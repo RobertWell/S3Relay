@@ -91,6 +91,10 @@ s3relay-tests:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 build-image-s3relay:
+  # HEL-665: one heavy-I/O job (image build / scan / validate) at a time in this project; a job waiting
+  # for the group is not running, so its timeout does not tick. Two such jobs overlapping a
+  # start-of-job write burst cost the k8s datastore its lease writes (10-31 21:40Z, 11-01 00:03Z).
+  resource_group: lan-heavy-io
   stage: build
   image: docker:27
   timeout: 2h
