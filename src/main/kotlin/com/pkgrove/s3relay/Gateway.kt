@@ -112,6 +112,7 @@ class Gateway(
             Metrics.gauge("s3relay_cache_used_bytes", cache) { it.usedBytes().toDouble() }
             Metrics.gauge("s3relay_cache_pinned_bytes", cache) { it.pinnedBytes().toDouble() }
             Metrics.gauge("s3relay_cache_pending_objects", cache) { it.entries().count { e -> e.state != SyncState.SYNCED }.toDouble() }
+            Metrics.gauge("s3relay_cache_pending_oldest_age_seconds", cache) { it.oldestPendingAgeSeconds() }
         }
     }
 

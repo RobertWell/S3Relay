@@ -16,6 +16,21 @@ class CacheStoreTest {
         c.commit(bucket, key, t, state, "e", "application/octet-stream", null)
     }
 
+    @Test fun `the oldest unconfirmed object's age is the pending age, 0 when everything is SYNCED`() {
+        val c = store(10_000)
+        write(c, "b", "synced", 10, SyncState.SYNCED)
+        assertEquals(0.0, c.oldestPendingAgeSeconds())
+        write(c, "b", "pending-1", 10, SyncState.PENDING_REMOTE)
+        val first = c.peek("b", "pending-1")!!.cachedAt
+        Thread.sleep(5)
+        write(c, "b", "pending-2", 10, SyncState.PENDING_REMOTE)
+        val age = c.oldestPendingAgeSeconds(first.plusSeconds(1800))
+        assertEquals(1800.0, age, 0.001)            // measured from the OLDEST pending copy
+        c.setState("b", "pending-1", SyncState.SYNCED, "e1")
+        c.setState("b", "pending-2", SyncState.SYNCED, "e2")
+        assertEquals(0.0, c.oldestPendingAgeSeconds())
+    }
+
     @Test fun `only SYNCED objects are evicted, LRU first`() {
         val c = store(1000)
         write(c, "b", "synced-old", 300, SyncState.SYNCED); Thread.sleep(2)

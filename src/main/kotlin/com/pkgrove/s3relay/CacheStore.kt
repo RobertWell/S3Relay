@@ -81,6 +81,14 @@ class CacheStore(
     fun lock(bucket: String, key: String): Any = stripes[(id(bucket, key).hashCode() and 0x7fffffff) % stripes.size]
     /** Bytes that cannot be evicted because upstream has not confirmed them. */
     fun pinnedBytes(): Long = index.values.filter { !it.evictable() }.sumOf { it.size }
+
+    /** PM 11-09 (HEL-832): seconds since the OLDEST object not yet confirmed upstream was cached; 0 when none is.
+     *  A PENDING_REMOTE copy exists only after its PUT was answered 503 (not durable), so a growing age means
+     *  upstream has refused or been unreachable that long: the reconciler cannot clear it and it pins cache disk.
+     *  SYNCING (an upload in flight) counts too; the upload timeout bounds it, far under any alert threshold. */
+    fun oldestPendingAgeSeconds(now: Instant = Instant.now()): Double =
+        index.values.filter { !it.evictable() }.minOfOrNull { it.cachedAt }
+            ?.let { java.time.Duration.between(it, now).toMillis() / 1000.0 } ?: 0.0
     /** Would `more` bytes fit under maxBytes right now, counting what in-flight transfers have reserved? (maxBytes <= 0 = unbounded) */
     fun canAccept(more: Long): Boolean = maxBytes <= 0 || bytes.get() + reserved.get() + more <= maxBytes
     fun reservedBytes() = reserved.get()
