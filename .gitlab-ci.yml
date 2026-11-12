@@ -82,6 +82,9 @@ s3relay-tests:
     when: always
     paths:
       - target/surefire-reports/
+      # HEL-841: every pom this build resolved (parents, BOMs, dependencies), for dep-scan's trivy to read
+      # locally; the runners have no shared cache, so a cache never reaches the next job
+      - .m2/repository/**/*.pom
     reports:
       junit: target/surefire-reports/TEST-*.xml
     expire_in: 7 days
@@ -205,13 +208,15 @@ dep-scan:
     TRIVY_SKIP_VERSION_CHECK: "true"
     HELLO_SRE_REF: "4933c7f46d04563d4521bb69725b53fb8ab49b20"
   cache:
-    - key: trivy-dbs-$CI_COMMIT_REF_PROTECTED   # a branch-wide job never writes the cache the main-only gate reads
-      paths: [.trivycache]
-    # HEL-841 (11-12): trivy resolves the pom's parents/BOMs from ~/.m2 first. Without it every scan asked
-    # Maven Central for aws-sdk-java-pom and friends, and Central's 429 IP block failed the gate (job 25992).
-    # Read-only here; s3relay-tests on the same ref writes it. A miss falls back to Central, as before.
-    - <<: *maven_cache
-      policy: pull
+    key: trivy-dbs-$CI_COMMIT_REF_PROTECTED   # a branch-wide job never writes the cache the main-only gate reads
+    paths: [.trivycache]
+  # HEL-841 (11-12): trivy resolves the pom's parents/BOMs from ~/.m2 first. Without them every scan asked Maven
+  # Central for aws-sdk-java-pom / quarkus-bom, and Central's 429 IP block failed the gate (jobs 25992, 26009).
+  # The runners have no shared cache server, so the poms come as s3relay-tests' artifact of this pipeline. A
+  # pom missing from it still falls back to Central, which fails closed on a 429.
+  needs:
+    - job: s3relay-tests
+      artifacts: true
   script:
     - *trivy_dbs_from_mirror
     - set -a; . ./trivy-db.env; set +a
