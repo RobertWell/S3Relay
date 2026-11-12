@@ -170,3 +170,89 @@ secret-scan:
     - if: $CI_PIPELINE_SOURCE == "schedule"
       when: never
     - when: on_success
+
+# HEL-841 scope 3: this repo had no vulnerability scan at all (PM inventory 11-11). Same gates as QuerySkiff:
+# trivy's DBs come from the hello-sre mirror (pinned HELLO_SRE_REF), fixable HIGH/CRITICAL block, and accepted
+# ones go in .trivyignore.yaml with an expiry (the register), so new exposure still fails.
+.trivy_dbs_from_mirror: &trivy_dbs_from_mirror
+  - |
+    set -e
+    # Bounded retry (HEL-528 shape): the Alpine CDN index fetch hit a transient DNS error in hello-stock on
+    # 2026-10-03 and killed a scan before trivy ran.
+    ok=0; for attempt in 1 2 3; do apk add --no-cache -q curl python3 git >/dev/null 2>&1 && { ok=1; break; }; echo "apk attempt $attempt failed - retrying in 15s"; sleep 15; done; [ "$ok" = 1 ] || { echo "ERROR: apk could not install curl/python3/git after 3 attempts"; exit 2; }
+    rm -rf hello-sre && git init -q hello-sre && cd hello-sre
+    git -c credential.helper='!f() { echo username=gitlab-ci-token; echo "password=$CI_JOB_TOKEN"; }; f' fetch -q --depth 1 "http://gitlab.gitlab.svc.cluster.local/root/hello-sre.git" "$HELLO_SRE_REF"
+    git checkout -q FETCH_HEAD; [ "$(git rev-parse HEAD)" = "$HELLO_SRE_REF" ] || { echo "ERROR: hello-sre did not resolve to the pinned $HELLO_SRE_REF"; exit 2; }
+    cd "$CI_PROJECT_DIR"
+    . hello-sre/scripts/ci/trivy-db-fetch.sh
+    if fetch_trivy_dbs 1; then echo "--- trivy DBs from the hello-sre mirror"; echo "TRIVY_SKIP_DB_UPDATE=true" >> trivy-db.env; echo "TRIVY_SKIP_JAVA_DB_UPDATE=true" >> trivy-db.env
+    else echo "--- mirror unavailable: trivy downloads its DBs live"; : > trivy-db.env; fi
+
+dep-scan:
+  resource_group: lan-heavy-io
+  stage: test
+  image:
+    name: aquasec/trivy:0.71.2
+    entrypoint: [""]
+  timeout: 60 minutes
+  variables:
+    TRIVY_DB_REPOSITORY: "public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
+    TRIVY_CACHE_DIR: $CI_PROJECT_DIR/.trivycache
+    TRIVY_TIMEOUT: 40m
+    TRIVY_SKIP_VERSION_CHECK: "true"
+    HELLO_SRE_REF: "4933c7f46d04563d4521bb69725b53fb8ab49b20"
+  cache:
+    key: trivy-dbs
+    paths: [.trivycache]
+  script:
+    - *trivy_dbs_from_mirror
+    - set -a; . ./trivy-db.env; set +a
+    - echo "=== dependency scan of the source tree (fixable HIGH/CRITICAL block; register .trivyignore.yaml)"
+    - trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 0 --format json --output dep-scan.json --skip-dirs hello-sre .
+    - trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed --ignorefile .trivyignore.yaml --skip-dirs hello-sre --format table .
+  artifacts:
+    when: always
+    paths: [dep-scan.json]
+    expire_in: 30 days
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+# The shipped artefact itself (what the source scan cannot see: the OS layer and what the build pulled in), on
+# main after build-image-s3relay, read back through the LAN pull-through cache.
+cve-scan-artifact:
+  resource_group: lan-heavy-io
+  stage: build
+  image:
+    name: aquasec/trivy:0.71.2
+    entrypoint: [""]
+  timeout: 60 minutes
+  needs:
+    - job: build-image-s3relay
+      optional: true
+  variables:
+    TRIVY_DB_REPOSITORY: "public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
+    TRIVY_CACHE_DIR: $CI_PROJECT_DIR/.trivycache
+    TRIVY_TIMEOUT: 40m
+    TRIVY_SKIP_VERSION_CHECK: "true"
+    IMAGE_REF: "roguerzzz123/s3relay:$CI_COMMIT_SHORT_SHA"
+    MIRROR: "10.152.183.230:5000"
+    HELLO_SRE_REF: "4933c7f46d04563d4521bb69725b53fb8ab49b20"
+  cache:
+    key: trivy-dbs
+    paths: [.trivycache]
+  script:
+    - *trivy_dbs_from_mirror
+    - set -a; . ./trivy-db.env; set +a
+    - echo "=== artefact scan of $IMAGE_REF (via $MIRROR)"
+    - trivy image --insecure --scanners vuln --severity HIGH,CRITICAL --exit-code 0 --format json --output artifact-cve.json "$MIRROR/$IMAGE_REF"
+    - trivy image --insecure --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed --ignorefile .trivyignore.yaml --format table "$MIRROR/$IMAGE_REF"
+  artifacts:
+    when: always
+    paths: [artifact-cve.json]
+    expire_in: 30 days
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

@@ -1,0 +1,4 @@
+# HEL-841: Trivy exception register for S3Relay (dep-scan, cve-scan-artifact). Each entry is a KNOWN fixable
+# HIGH/CRITICAL with an owner reason and an expiry (trivy ignores an expired entry, so it blocks again).
+# New exposure fails the gate. Started empty on 2026-11-12.
+vulnerabilities: []
