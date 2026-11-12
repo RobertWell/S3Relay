@@ -205,14 +205,21 @@ dep-scan:
     TRIVY_SKIP_VERSION_CHECK: "true"
     HELLO_SRE_REF: "4933c7f46d04563d4521bb69725b53fb8ab49b20"
   cache:
-    key: trivy-dbs-$CI_COMMIT_REF_PROTECTED   # a branch-wide job never writes the cache the main-only gate reads
-    paths: [.trivycache]
+    - key: trivy-dbs-$CI_COMMIT_REF_PROTECTED   # a branch-wide job never writes the cache the main-only gate reads
+      paths: [.trivycache]
+    # HEL-841 (11-12): trivy resolves the pom's parents/BOMs from ~/.m2 first. Without it every scan asked
+    # Maven Central for aws-sdk-java-pom and friends, and Central's 429 IP block failed the gate (job 25992).
+    # Read-only here; s3relay-tests on the same ref writes it. A miss falls back to Central, as before.
+    - <<: *maven_cache
+      policy: pull
   script:
     - *trivy_dbs_from_mirror
     - set -a; . ./trivy-db.env; set +a
+    - mkdir -p "$HOME/.m2" && printf '<settings><localRepository>%s</localRepository></settings>\n' "$CI_PROJECT_DIR/.m2/repository" > "$HOME/.m2/settings.xml"
+    - echo "=== local Maven repository for trivy - $(find .m2/repository -name '*.pom' 2>/dev/null | wc -l) poms cached"
     - echo "=== dependency scan of the source tree (fixable HIGH/CRITICAL block; register .trivyignore.yaml)"
-    - trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 0 --format json --output dep-scan.json --skip-dirs hello-sre .
-    - trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed --ignorefile .trivyignore.yaml --skip-dirs hello-sre --format table .
+    - trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 0 --format json --output dep-scan.json --skip-dirs hello-sre --skip-dirs .m2 .
+    - trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed --ignorefile .trivyignore.yaml --skip-dirs hello-sre --skip-dirs .m2 --format table .
   artifacts:
     when: always
     paths: [dep-scan.json]
