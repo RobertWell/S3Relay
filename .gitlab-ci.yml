@@ -137,7 +137,10 @@ build-image-s3relay:
         echo "tag=$ref"
         echo "pin=$DOCKERHUB_USERNAME/s3relay@$digest"
       } | tee evidence/IMAGE.txt
+      echo "IMAGE_DIGEST=$digest" > build.env   # HEL-841: cve-scan-artifact scans exactly this digest
   artifacts:
+    reports:
+      dotenv: build.env
     paths:
       - evidence/
     expire_in: never
@@ -202,7 +205,7 @@ dep-scan:
     TRIVY_SKIP_VERSION_CHECK: "true"
     HELLO_SRE_REF: "4933c7f46d04563d4521bb69725b53fb8ab49b20"
   cache:
-    key: trivy-dbs
+    key: trivy-dbs-$CI_COMMIT_REF_PROTECTED   # a branch-wide job never writes the cache the main-only gate reads
     paths: [.trivycache]
   script:
     - *trivy_dbs_from_mirror
@@ -236,16 +239,19 @@ cve-scan-artifact:
     TRIVY_CACHE_DIR: $CI_PROJECT_DIR/.trivycache
     TRIVY_TIMEOUT: 40m
     TRIVY_SKIP_VERSION_CHECK: "true"
-    IMAGE_REF: "roguerzzz123/s3relay:$CI_COMMIT_SHORT_SHA"
+    IMAGE_REPO: "roguerzzz123/s3relay"
     MIRROR: "10.152.183.230:5000"
     HELLO_SRE_REF: "4933c7f46d04563d4521bb69725b53fb8ab49b20"
   cache:
-    key: trivy-dbs
+    key: trivy-dbs-$CI_COMMIT_REF_PROTECTED   # a branch-wide job never writes the cache the main-only gate reads
     paths: [.trivycache]
   script:
     - *trivy_dbs_from_mirror
     - set -a; . ./trivy-db.env; set +a
-    - echo "=== artefact scan of $IMAGE_REF (via $MIRROR)"
+    # the digest the build pushed (its dotenv artifact), not a tag: a pull by digest is content-addressed, so the
+    # plain-HTTP mirror cannot hand back anything else, and the scan is of the shipped image (security review 11-12)
+    - '[ -n "${IMAGE_DIGEST:-}" ] || { echo "no IMAGE_DIGEST from the build job: refusing to scan a tag"; exit 1; }'
+    - IMAGE_REF="$IMAGE_REPO@$IMAGE_DIGEST"; echo "=== artefact scan of $IMAGE_REF (via $MIRROR)"
     - trivy image --insecure --scanners vuln --severity HIGH,CRITICAL --exit-code 0 --format json --output artifact-cve.json "$MIRROR/$IMAGE_REF"
     - trivy image --insecure --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed --ignorefile .trivyignore.yaml --format table "$MIRROR/$IMAGE_REF"
   artifacts:
