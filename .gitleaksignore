@@ -1,0 +1,5 @@
+# HEL-841: known gitleaks findings, by exact fingerprint (scripts/ci/secret-scan.sh). Generated 2026-11-12 from the
+# 11-11 sweep (test fixtures, dev-profile keys, placeholders; history values revoked or never real). Values are
+# never listed. A NEW finding fails even in one of these files; a real credential is rotated, not added here.
+# tree (file:rule:line)
+# history (commit:file:rule:line)

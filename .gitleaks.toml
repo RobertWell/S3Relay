@@ -1,0 +1,4 @@
+# HEL-841: secret scanning (gitleaks 8.24.3; scripts/ci/secret-scan.sh, CI job secret-scan). The default rules,
+# nothing allowed by path or pattern: known findings are exact fingerprints in .gitleaksignore.
+[extend]
+useDefault = true
