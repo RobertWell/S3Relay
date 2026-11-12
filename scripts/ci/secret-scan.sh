@@ -21,6 +21,8 @@ fi
 echo "=== secret scan: tree at $(git rev-parse --short HEAD)"
 gitleaks dir . --config "$CFG" --gitleaks-ignore-path "$IGN" --redact=100 --no-banner --exit-code 1 -f json -r "$OUT" || rc=1
 echo "=== secret scan: full history of HEAD ($(git rev-list --count HEAD) commits)"
-gitleaks git . --config "$CFG" --gitleaks-ignore-path "$IGN" --redact=100 --no-banner --exit-code 1 -f json -r "commits-$OUT" || rc=1
+# HEAD's history only: a clone that fetched every branch (hello-sre's .clone_internal) would otherwise scan
+# other branches too (CI job 25683: 853 commits, 21 findings on old branches); a branch is scanned in its own pipeline
+gitleaks git . --log-opts="HEAD" --config "$CFG" --gitleaks-ignore-path "$IGN" --redact=100 --no-banner --exit-code 1 -f json -r "commits-$OUT" || rc=1
 [ "$rc" = 0 ] && echo "secret scan: clean" || echo "SECRET SCAN FAILED: rotate the credential, then remove it (values are redacted above)"
 exit "$rc"
